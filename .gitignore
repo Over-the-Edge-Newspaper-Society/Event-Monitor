@@ -1,0 +1,7 @@
+# Dependencies
+node_modules/
+.venv/
+backend/instaloader_session/
+
+# macOS
+.DS_Store

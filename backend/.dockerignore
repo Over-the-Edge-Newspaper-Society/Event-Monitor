@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+*.so
+*.pyd
+*.sqlite
+*.db
+.env
+.venv/
+instagram_monitor.db
+app/static/images/
+instaloader_session/

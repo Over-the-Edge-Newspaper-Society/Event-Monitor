@@ -1,0 +1,123 @@
+from __future__ import annotations
+
+from datetime import datetime
+from typing import Optional
+
+from sqlalchemy import (
+    Boolean,
+    Column,
+    DateTime,
+    Enum,
+    Float,
+    ForeignKey,
+    Integer,
+    JSON,
+    String,
+    Text,
+    UniqueConstraint,
+)
+from sqlalchemy.orm import relationship
+
+from .database import Base
+
+
+class ClassificationModeEnum(str):
+    MANUAL = "manual"
+    AUTO = "auto"
+
+
+class Club(Base):
+    __tablename__ = "clubs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String(255), nullable=False)
+    username = Column(String(255), unique=True, nullable=False, index=True)
+    active = Column(Boolean, default=True, nullable=False)
+    classification_mode = Column(String(20), default=ClassificationModeEnum.AUTO, nullable=False)
+    last_checked = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+    posts = relationship("Post", back_populates="club", cascade="all, delete-orphan")
+
+
+class Post(Base):
+    __tablename__ = "posts"
+    __table_args__ = (UniqueConstraint("instagram_id", name="uq_posts_instagram_id"),)
+
+    id = Column(Integer, primary_key=True)
+    club_id = Column(Integer, ForeignKey("clubs.id", ondelete="CASCADE"), nullable=False)
+    instagram_id = Column(String(255), nullable=False)
+    image_url = Column(Text, nullable=True)
+    local_image_path = Column(String(255), nullable=True)
+    caption = Column(Text, nullable=True)
+    post_timestamp = Column(DateTime, nullable=False)
+    collected_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    is_event_poster = Column(Boolean, nullable=True)
+    classification_confidence = Column(Float, nullable=True)
+    processed = Column(Boolean, default=False, nullable=False)
+    manual_review_notes = Column(Text, nullable=True)
+
+    club = relationship("Club", back_populates="posts")
+    extracted_event = relationship(
+        "ExtractedEvent",
+        back_populates="post",
+        uselist=False,
+        cascade="all, delete-orphan",
+    )
+
+
+class ExtractedEvent(Base):
+    __tablename__ = "extracted_events"
+
+    id = Column(Integer, primary_key=True)
+    post_id = Column(Integer, ForeignKey("posts.id", ondelete="CASCADE"), nullable=False, unique=True)
+    event_data_json = Column(JSON, nullable=False)
+    extraction_confidence = Column(Float, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    imported_to_eventscrape = Column(Boolean, default=False, nullable=False)
+
+    post = relationship("Post", back_populates="extracted_event")
+
+
+class SystemSetting(Base):
+    __tablename__ = "system_settings"
+
+    id = Column(Integer, primary_key=True)
+    monitoring_enabled = Column(Boolean, default=False, nullable=False)
+    monitor_interval_minutes = Column(Integer, default=30, nullable=False)
+    classification_mode = Column(String(20), default=ClassificationModeEnum.AUTO, nullable=False)
+    instaloader_username = Column(String(255), nullable=True)
+    instaloader_session_uploaded_at = Column(DateTime, nullable=True)
+    club_fetch_delay_seconds = Column(Integer, default=2, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+
+def ensure_default_settings(session) -> SystemSetting:
+    setting: Optional[SystemSetting] = session.query(SystemSetting).order_by(SystemSetting.id).first()
+    if setting is None:
+        setting = SystemSetting(
+            monitoring_enabled=False,
+            monitor_interval_minutes=30,
+            classification_mode=ClassificationModeEnum.AUTO,
+            club_fetch_delay_seconds=2,
+        )
+        session.add(setting)
+        session.commit()
+        session.refresh(setting)
+    else:
+        updated = False
+        if setting.monitor_interval_minutes is None:
+            setting.monitor_interval_minutes = 30
+            updated = True
+        if not getattr(setting, "classification_mode", None):
+            setting.classification_mode = ClassificationModeEnum.AUTO
+            updated = True
+        if setting.club_fetch_delay_seconds is None:
+            setting.club_fetch_delay_seconds = 2
+            updated = True
+        if updated:
+            session.commit()
+            session.refresh(setting)
+    return setting
