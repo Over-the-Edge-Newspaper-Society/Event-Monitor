@@ -530,6 +530,22 @@ def _render_status(settings) -> MonitorStatus:
 
 
 def _system_settings_out(settings) -> SystemSettingsOut:
-    data = SystemSettingsOut.from_orm(settings)
-    data.has_apify_token = bool(getattr(settings, "apify_api_token", None))
-    return data
+    def _iso(dt):
+        return dt.isoformat() if isinstance(dt, datetime) else None
+
+    return SystemSettingsOut(
+        id=settings.id,
+        monitoring_enabled=bool(settings.monitoring_enabled),
+        monitor_interval_minutes=settings.monitor_interval_minutes,
+        classification_mode=settings.classification_mode,
+        instaloader_username=settings.instaloader_username,
+        instaloader_session_uploaded_at=_iso(settings.instaloader_session_uploaded_at),
+        club_fetch_delay_seconds=settings.club_fetch_delay_seconds,
+        apify_enabled=bool(settings.apify_enabled),
+        apify_actor_id=settings.apify_actor_id,
+        apify_results_limit=settings.apify_results_limit,
+        has_apify_token=bool(getattr(settings, "apify_api_token", None)),
+        instagram_fetcher=(settings.instagram_fetcher or "auto"),
+        created_at=_iso(settings.created_at),
+        updated_at=_iso(settings.updated_at),
+    )
