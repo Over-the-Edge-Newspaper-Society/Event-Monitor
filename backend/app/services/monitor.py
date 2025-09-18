@@ -7,7 +7,7 @@ import random
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Callable, Dict, Iterable, List, Optional, Set
+from typing import Any, Callable, Dict, Iterable, List, Optional, Set
 
 from sqlalchemy.orm import Session
 
@@ -15,6 +15,16 @@ from ..models import Club, Post, ClassificationModeEnum, ensure_default_settings
 from .classifier import CaptionClassifier
 from ..utils.image_downloader import download_image
 from ..utils.apify_client import ApifyClient, ApifyClientError, ApifyRunTimeoutError
+
+APIFY_DEFAULT_INPUT = {
+    "addParentData": False,
+    "enhanceUserSearchWithFacebookPage": False,
+    "isUserReelFeedURL": False,
+    "isUserTaggedFeedURL": False,
+    "searchType": "hashtag",
+    "searchLimit": 1,
+}
+APIFY_BATCH_SIZE = int(os.getenv("APIFY_BATCH_SIZE", "8"))
 
 try:
     from instaloader import Instaloader, Profile
@@ -28,6 +38,11 @@ else:
 
 class RateLimitError(Exception):
     """Raised when Instagram responds with a temporary rate limit / throttle message."""
+    pass
+
+
+class ApifyIntegrationError(Exception):
+    """Raised when Apify integration encounters an unrecoverable error."""
     pass
 
 
@@ -50,6 +65,7 @@ class MonitorService:
         self._known_post_break_threshold = int(os.getenv("INSTAGRAM_KNOWN_POST_BREAK_THRESHOLD", "2"))
         self._apify_client: Optional[ApifyClient] = None
         self._apify_signature: Optional[str] = None
+        self._apify_timeout_seconds = int(os.getenv("APIFY_RUN_TIMEOUT_SECONDS", "180"))
 
     @property
     def last_run(self) -> Optional[datetime]:
@@ -176,16 +192,39 @@ class MonitorService:
         global_auto = (settings.classification_mode or ClassificationModeEnum.MANUAL).lower() == ClassificationModeEnum.AUTO
 
         clubs: Iterable[Club] = session.query(Club).filter(Club.active.is_(True)).all()
+        mode = self._get_fetch_mode(settings)
+        apify_bulk_cache: Dict[str, List[Dict]] = {}
+        known_map: Dict[str, Set[str]] = {}
+        if mode == "apify":
+            apify_client = self._get_apify_client(settings)
+            if not apify_client:
+                raise ApifyIntegrationError("Apify integration is not configured.")
+            usernames = [club.username for club in clubs]
+            known_map = {
+                club.username: self._get_recent_post_ids(session, club.id)
+                for club in clubs
+            }
+            limit = settings.apify_results_limit or post_count
+            apify_bulk_cache = self._collect_posts_via_apify_bulk(
+                apify_client,
+                usernames,
+                limit,
+                known_map,
+            )
+
         try:
             for club in clubs:
                 stats["clubs"] += 1
-                known_post_ids = self._get_recent_post_ids(session, club.id)
-                posts = self._fetch_latest_posts_for_club(
-                    settings,
-                    club.username,
-                    post_count,
-                    known_post_ids,
-                )
+                known_post_ids = known_map.get(club.username) if mode == "apify" else self._get_recent_post_ids(session, club.id)
+                if mode == "apify":
+                    posts = apify_bulk_cache.get(club.username, [])
+                else:
+                    posts = self._fetch_latest_posts_for_club(
+                        settings,
+                        club.username,
+                        post_count,
+                        known_post_ids,
+                    )
                 for post in posts:
                     auto_classify = global_auto and (club.classification_mode or ClassificationModeEnum.MANUAL).lower() == ClassificationModeEnum.AUTO
                     if self._create_post_if_new(session, club, post, auto_classify):
@@ -199,6 +238,9 @@ class MonitorService:
             self.clear_backoff()
             return stats
         except RateLimitError:
+            raise
+        except ApifyIntegrationError:
+            session.rollback()
             raise
 
     def _collect_latest_posts(
@@ -257,18 +299,45 @@ class MonitorService:
 
         self._last_run = datetime.utcnow()
         clubs: Iterable[Club] = session.query(Club).filter(Club.active.is_(True)).all()
+        mode = self._get_fetch_mode(settings)
+        apify_bulk_cache: Dict[str, List[Dict]] = {}
+        known_map: Dict[str, Set[str]] = {}
+        if mode == "apify":
+            apify_client = self._get_apify_client(settings)
+            if not apify_client:
+                raise ApifyIntegrationError("Apify integration is not configured.")
+            usernames = [club.username for club in clubs]
+            known_map = {
+                club.username: self._get_recent_post_ids(session, club.id)
+                for club in clubs
+            }
+            limit = settings.apify_results_limit or 30
+            apify_bulk_cache = self._collect_posts_via_apify_bulk(
+                apify_client,
+                usernames,
+                limit,
+                known_map,
+            )
+
         try:
             for club in clubs:
                 stats["clubs"] += 1
                 lookback_start = club.last_checked or (datetime.utcnow() - timedelta(hours=24))
                 lookback_start -= timedelta(minutes=5)
-                known_post_ids = self._get_recent_post_ids(session, club.id)
-                posts = self._fetch_recent_posts_for_club(
-                    settings,
-                    club.username,
-                    lookback_start,
-                    known_post_ids,
-                )
+                known_post_ids = known_map.get(club.username) if mode == "apify" else self._get_recent_post_ids(session, club.id)
+                if mode == "apify":
+                    posts = [
+                        post
+                        for post in apify_bulk_cache.get(club.username, [])
+                        if post.get("timestamp") and post["timestamp"] >= lookback_start
+                    ]
+                else:
+                    posts = self._fetch_recent_posts_for_club(
+                        settings,
+                        club.username,
+                        lookback_start,
+                        known_post_ids,
+                    )
                 for post in posts:
                     auto_classify = global_auto and (club.classification_mode or ClassificationModeEnum.MANUAL).lower() == ClassificationModeEnum.AUTO
                     if self._create_post_if_new(session, club, post, auto_classify):
@@ -282,6 +351,9 @@ class MonitorService:
             self.clear_backoff()
             return stats
         except RateLimitError:
+            raise
+        except ApifyIntegrationError:
+            session.rollback()
             raise
 
     def _create_post_if_new(self, session: Session, club: Club, post: Dict, auto_classify: bool) -> bool:
@@ -465,7 +537,7 @@ class MonitorService:
         mode = self._get_fetch_mode(settings)
         if mode == "apify":
             return False
-        return True
+        return bool(self.loader)
 
     def _get_apify_client(self, settings) -> Optional[ApifyClient]:
         if not self._should_use_apify(settings):
@@ -493,15 +565,20 @@ class MonitorService:
         known_post_ids: Optional[Set[str]] = None,
     ) -> List[Dict]:
         run_input = {
+            **APIFY_DEFAULT_INPUT,
             "directUrls": [f"https://www.instagram.com/{username}/"],
             "resultsType": "posts",
-            "resultsLimit": limit,
-            "addParentData": False,
+            "resultsLimit": max(limit, 1),
+            "maxItems": max(limit, 1),
         }
         try:
-            items = client.run_and_collect(run_input, dataset_limit=limit)
+            items = client.run_and_collect(
+                run_input,
+                dataset_limit=limit,
+                timeout_seconds=self._apify_timeout_seconds,
+            )
         except (ApifyClientError, ApifyRunTimeoutError) as exc:
-            raise ApifyClientError(str(exc)) from exc
+            raise ApifyIntegrationError(str(exc)) from exc
 
         posts: List[Dict] = []
         consecutive_known = 0
@@ -541,6 +618,115 @@ class MonitorService:
             )
         return posts
 
+    def _collect_posts_via_apify_bulk(
+        self,
+        client: ApifyClient,
+        usernames: List[str],
+        limit_per_username: int,
+        known_ids_map: Optional[Dict[str, Set[str]]] = None,
+    ) -> Dict[str, List[Dict]]:
+        if not usernames:
+            return {}
+        posts_by_user: Dict[str, List[Dict]] = {username: [] for username in usernames}
+        known_ids_map = known_ids_map or {}
+        batch_size = max(APIFY_BATCH_SIZE, 1)
+        ordered_usernames = [u for u in usernames if u]
+
+        def process_chunk(chunk: List[str]) -> None:
+            if not chunk:
+                return
+            chunk_limit = max(limit_per_username * len(chunk), limit_per_username, 1)
+            run_input = {
+                **APIFY_DEFAULT_INPUT,
+                "directUrls": [f"https://www.instagram.com/{username}/" for username in chunk],
+                "resultsType": "posts",
+                "resultsLimit": chunk_limit,
+                "maxItems": chunk_limit,
+            }
+            try:
+                items = client.run_and_collect(
+                    run_input,
+                    dataset_limit=chunk_limit,
+                    timeout_seconds=self._apify_timeout_seconds,
+                )
+            except (ApifyIntegrationError, ApifyRunTimeoutError):
+                if len(chunk) == 1:
+                    raise
+                mid = len(chunk) // 2
+                process_chunk(chunk[:mid])
+                process_chunk(chunk[mid:])
+                return
+
+            consecutive_known: Dict[str, int] = {username: 0 for username in chunk}
+            for item in items:
+                username = self._extract_username_from_item(item)
+                if not username or username not in posts_by_user:
+                    continue
+                if len(posts_by_user[username]) >= limit_per_username:
+                    continue
+
+                shortcode = item.get("shortCode") or item.get("shortcode") or item.get("id")
+                if not shortcode:
+                    continue
+                known_ids = known_ids_map.get(username)
+                if known_ids and shortcode in known_ids:
+                    consecutive_known[username] += 1
+                    if consecutive_known[username] >= max(self._known_post_break_threshold, 1):
+                        continue
+                    continue
+                consecutive_known[username] = 0
+
+                timestamp_value = item.get("timestamp")
+                timestamp_dt = datetime.utcnow()
+                if isinstance(timestamp_value, str):
+                    try:
+                        timestamp_dt = datetime.fromisoformat(timestamp_value.replace("Z", "+00:00")).replace(tzinfo=None)
+                    except ValueError:
+                        pass
+                caption = item.get("caption") or ""
+                image_url = item.get("displayUrl") or item.get("display_url")
+                if not image_url:
+                    images = item.get("images") or []
+                    if images:
+                        first = images[0]
+                        if isinstance(first, dict):
+                            image_url = first.get("url") or first.get("displayUrl")
+
+                posts_by_user[username].append(
+                    {
+                        "id": shortcode,
+                        "caption": caption,
+                        "image_url": image_url,
+                        "timestamp": timestamp_dt,
+                        "is_video": item.get("type") == "Video",
+                    }
+                )
+
+        idx = 0
+        while idx < len(ordered_usernames):
+            chunk = ordered_usernames[idx : idx + batch_size]
+            process_chunk(chunk)
+            idx += batch_size
+
+        for username in posts_by_user:
+            posts_by_user[username].sort(key=lambda x: x.get("timestamp") or datetime.min, reverse=True)
+            posts_by_user[username] = posts_by_user[username][:limit_per_username]
+        return posts_by_user
+
+    @staticmethod
+    def _extract_username_from_item(item: Dict[str, Any]) -> Optional[str]:
+        username = item.get("ownerUsername") or item.get("owner_username")
+        if username:
+            return username
+        input_url = item.get("inputUrl") or item.get("input_url")
+        if input_url and "instagram.com" in input_url:
+            try:
+                parts = input_url.strip("/").split("/")
+                return parts[-1] or None
+            except Exception:  # pragma: no cover - defensive
+                return None
+        return None
+
     def _fetch_latest_posts_for_club(
         self,
         settings,
@@ -552,17 +738,20 @@ class MonitorService:
         posts: List[Dict] = []
         apify_client: Optional[ApifyClient] = None
 
-        if mode == "apify" or (mode == "auto" and (not self._should_use_instaloader(settings) or not self.loader)):
+        if mode == "apify" or (mode == "auto" and (not self._should_use_instaloader(settings))):
             apify_client = self._get_apify_client(settings)
             if not apify_client:
                 if mode == "apify":
                     self.set_last_error("Apify integration is not configured.")
-                    return []
+                    raise ApifyIntegrationError("Apify integration is not configured.")
             else:
                 try:
                     limit = settings.apify_results_limit or count
                     posts = self._collect_posts_via_apify(apify_client, username, limit, known_post_ids)
-                except ApifyClientError as exc:
+                except (ApifyIntegrationError, ApifyRunTimeoutError) as exc:
+                    if mode == "apify":
+                        self.set_last_error(f"Apify error: {exc}")
+                        raise
                     self.set_last_error(f"Apify error: {exc}")
                     posts = []
                 if mode == "apify" or posts:
@@ -590,10 +779,10 @@ class MonitorService:
                 posts = self._collect_posts_via_apify(apify_client, username, limit, known_post_ids)
                 self.clear_backoff()
                 return posts
-            except ApifyClientError as apify_exc:
+            except (ApifyIntegrationError, ApifyRunTimeoutError) as apify_exc:
                 self.set_last_error(f"Apify error: {apify_exc}")
                 self._schedule_backoff()
-                raise RateLimitError(str(exc)) from apify_exc
+                raise
 
     def _fetch_recent_posts_for_club(
         self,
@@ -606,18 +795,21 @@ class MonitorService:
         posts: List[Dict] = []
         apify_client: Optional[ApifyClient] = None
 
-        if mode == "apify" or (mode == "auto" and (not self._should_use_instaloader(settings) or not self.loader)):
+        if mode == "apify" or (mode == "auto" and (not self._should_use_instaloader(settings))):
             apify_client = self._get_apify_client(settings)
             if not apify_client:
                 if mode == "apify":
                     self.set_last_error("Apify integration is not configured.")
-                    return []
+                    raise ApifyIntegrationError("Apify integration is not configured.")
             else:
                 try:
                     limit = settings.apify_results_limit or 30
                     posts = self._collect_posts_via_apify(apify_client, username, limit, known_post_ids)
                     posts = [p for p in posts if p.get("timestamp") and p["timestamp"] >= since]
-                except ApifyClientError as exc:
+                except (ApifyIntegrationError, ApifyRunTimeoutError) as exc:
+                    if mode == "apify":
+                        self.set_last_error(f"Apify error: {exc}")
+                        raise
                     self.set_last_error(f"Apify error: {exc}")
                     posts = []
                 if mode == "apify" or posts:
@@ -646,10 +838,10 @@ class MonitorService:
                 posts = [p for p in posts if p.get("timestamp") and p["timestamp"] >= since]
                 self.clear_backoff()
                 return posts
-            except ApifyClientError as apify_exc:
+            except (ApifyIntegrationError, ApifyRunTimeoutError) as apify_exc:
                 self.set_last_error(f"Apify error: {apify_exc}")
                 self._schedule_backoff()
-                raise RateLimitError(str(exc)) from apify_exc
+                raise
 
 
 monitor_service = MonitorService()

@@ -43,8 +43,8 @@ class ApifyClient:
         return payload.get("data", payload)
 
     def run_actor(self, run_input: Dict[str, Any]) -> Dict[str, Any]:
-        url = f"{self.base_url}/actors/{self.actor_id}/runs?token={self.api_token}"
-        data = self._request("POST", url, json={"input": run_input})
+        url = f"{self.base_url}/acts/{self.actor_id}/runs?token={self.api_token}"
+        data = self._request("POST", url, json=run_input)
         return data
 
     def get_run(self, run_id: str) -> Dict[str, Any]:

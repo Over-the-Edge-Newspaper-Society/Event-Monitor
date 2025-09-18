@@ -4,7 +4,7 @@ import asyncio
 import contextlib
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional, Set
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -27,7 +27,8 @@ from .schemas import (
     SystemSettingsUpdate,
     ApifyTokenUpdate,
 )
-from .services.monitor import monitor_service, RateLimitError
+from .services.monitor import monitor_service, RateLimitError, ApifyIntegrationError
+from .utils.apify_client import ApifyRunTimeoutError
 from .utils.csv_loader import import_clubs_from_csv
 
 app = FastAPI(title="Instagram Event Monitor")
@@ -298,6 +299,12 @@ async def fetch_latest_posts(post_count: int = 3, db: Session = Depends(get_db))
     except RateLimitError as exc:
         detail = str(exc) or "Instagram temporarily blocked our requests. Please try again later."
         raise HTTPException(status_code=429, detail=detail)
+    except ApifyIntegrationError as exc:
+        detail = str(exc) or "Apify integration failed to return results."
+        raise HTTPException(status_code=502, detail=detail)
+    except ApifyRunTimeoutError as exc:
+        detail = str(exc) or "Apify run timed out before completion."
+        raise HTTPException(status_code=504, detail=detail)
     except HTTPException:
         raise
     except Exception as e:
@@ -321,7 +328,7 @@ async def fetch_latest_posts_stream(post_count: int = 3, db: Session = Depends(g
                 return
 
             settings = ensure_default_settings(db)
-            fetch_mode = (settings.instagram_fetcher or "auto").lower()
+            fetch_mode = monitor_service._get_fetch_mode(settings)
             apify_ready = bool(settings.apify_api_token and settings.apify_actor_id)
             has_loader = bool(monitor_service.loader)
 
@@ -353,23 +360,65 @@ async def fetch_latest_posts_stream(post_count: int = 3, db: Session = Depends(g
             clubs = db.query(Club).filter(Club.active.is_(True)).all()
             total_clubs = len(clubs)
 
+            apify_bulk_cache: Dict[str, List[Dict]] = {}
+            apify_known_map: Dict[str, Set[str]] = {}
+            if fetch_mode == "apify":
+                apify_client = monitor_service._get_apify_client(settings)
+                if not apify_client:
+                    yield f"data: {json.dumps({'status': 'error', 'error': 'Apify integration is not configured.'})}\n\n"
+                    return
+                apify_known_map = {
+                    club.username: monitor_service._get_recent_post_ids(db, club.id)
+                    for club in clubs
+                }
+                limit = settings.apify_results_limit or post_count
+                try:
+                    apify_bulk_cache = monitor_service._collect_posts_via_apify_bulk(
+                        apify_client,
+                        [club.username for club in clubs],
+                        limit,
+                        apify_known_map,
+                    )
+                except ApifyIntegrationError as exc:
+                    yield f"data: {json.dumps({'status': 'error', 'error': str(exc) or 'Apify integration failed to return results.'})}\n\n"
+                    return
+
             for i, club in enumerate(clubs, 1):
                 yield f"data: {json.dumps({'status': 'processing', 'current_club': club.username, 'progress': i, 'total': total_clubs, 'message': f'Processing {club.name} ({i}/{total_clubs})'})}\n\n"
 
                 stats["clubs"] += 1
                 try:
-                    known_ids = monitor_service._get_recent_post_ids(db, club.id)
-                    posts = monitor_service._fetch_latest_posts_for_club(
-                        settings,
-                        club.username,
-                        post_count,
-                        known_ids,
-                    )
+                    if fetch_mode == "apify":
+                        known_ids = apify_known_map.get(club.username, set())
+                        posts = apify_bulk_cache.get(club.username, [])
+                    else:
+                        known_ids = monitor_service._get_recent_post_ids(db, club.id)
+                        posts = monitor_service._fetch_latest_posts_for_club(
+                            settings,
+                            club.username,
+                            post_count,
+                            known_ids,
+                        )
                 except RateLimitError as exc:
                     db.rollback()
                     monitor_service.set_last_error(str(exc))
                     monitor_service._schedule_backoff()
                     yield f"data: {json.dumps({'status': 'error', 'error': str(exc) or 'Instagram temporarily blocked our requests. Please try again later.'})}\n\n"
+                    return
+                except ApifyIntegrationError as exc:
+                    db.rollback()
+                    monitor_service.set_last_error(str(exc))
+                    yield f"data: {json.dumps({'status': 'error', 'error': str(exc) or 'Apify integration failed to return results.'})}\n\n"
+                    return
+                except ApifyRunTimeoutError as exc:
+                    db.rollback()
+                    monitor_service.set_last_error(str(exc))
+                    yield f"data: {json.dumps({'status': 'error', 'error': str(exc) or 'Apify run timed out before completion.'})}\n\n"
+                    return
+                except ApifyIntegrationError as exc:
+                    db.rollback()
+                    monitor_service.set_last_error(str(exc))
+                    yield f"data: {json.dumps({'status': 'error', 'error': str(exc) or 'Apify integration failed to return results.'})}\n\n"
                     return
 
                 for post in posts:
