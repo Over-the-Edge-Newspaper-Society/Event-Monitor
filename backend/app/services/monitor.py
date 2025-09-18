@@ -167,8 +167,12 @@ class MonitorService:
         self._last_run = datetime.utcnow()
 
         settings = ensure_default_settings(session)
-        if self._in_backoff() and not self._should_use_apify(settings):
-            return stats
+        if self._in_backoff():
+            fetch_mode = self._get_fetch_mode(settings)
+            if fetch_mode == "apify" and self._should_use_apify(settings):
+                self.clear_backoff()
+            elif not self._should_use_apify(settings):
+                return stats
         global_auto = (settings.classification_mode or ClassificationModeEnum.MANUAL).lower() == ClassificationModeEnum.AUTO
 
         clubs: Iterable[Club] = session.query(Club).filter(Club.active.is_(True)).all()
@@ -242,8 +246,12 @@ class MonitorService:
         if not settings.monitoring_enabled:
             return stats
 
-        if self._in_backoff() and not self._should_use_apify(settings):
-            return stats
+        if self._in_backoff():
+            fetch_mode = self._get_fetch_mode(settings)
+            if fetch_mode == "apify" and self._should_use_apify(settings):
+                self.clear_backoff()
+            elif not self._should_use_apify(settings):
+                return stats
 
         global_auto = (settings.classification_mode or ClassificationModeEnum.MANUAL).lower() == ClassificationModeEnum.AUTO
 
@@ -438,10 +446,26 @@ class MonitorService:
             self.session_username = None
             raise ValueError(f"Failed to load session from cookies: {exc}")
 
+    def _get_fetch_mode(self, settings) -> str:
+        mode = getattr(settings, "instagram_fetcher", "auto") or "auto"
+        return str(mode).lower()
+
+    def _apify_ready(self, settings) -> bool:
+        return bool(getattr(settings, "apify_api_token", None) and getattr(settings, "apify_actor_id", None))
+
     def _should_use_apify(self, settings) -> bool:
-        if not getattr(settings, "apify_enabled", False):
+        mode = self._get_fetch_mode(settings)
+        if mode == "apify":
+            return self._apify_ready(settings)
+        if mode == "auto":
+            return bool(getattr(settings, "apify_enabled", False) and self._apify_ready(settings))
+        return False
+
+    def _should_use_instaloader(self, settings) -> bool:
+        mode = self._get_fetch_mode(settings)
+        if mode == "apify":
             return False
-        return bool(settings.apify_api_token and settings.apify_actor_id)
+        return True
 
     def _get_apify_client(self, settings) -> Optional[ApifyClient]:
         if not self._should_use_apify(settings):
@@ -524,29 +548,36 @@ class MonitorService:
         count: int,
         known_post_ids: Optional[Set[str]],
     ) -> List[Dict]:
-        prefer_apify = self._should_use_apify(settings)
-        apify_client = self._get_apify_client(settings) if prefer_apify else None
+        mode = self._get_fetch_mode(settings)
         posts: List[Dict] = []
-        if apify_client:
-            try:
-                limit = settings.apify_results_limit or count
-                posts = self._collect_posts_via_apify(apify_client, username, limit, known_post_ids)
-            except ApifyClientError as exc:
-                self.set_last_error(f"Apify error: {exc}")
-                posts = []
+        apify_client: Optional[ApifyClient] = None
 
-        if posts:
+        if mode == "apify" or (mode == "auto" and (not self._should_use_instaloader(settings) or not self.loader)):
+            apify_client = self._get_apify_client(settings)
+            if not apify_client:
+                if mode == "apify":
+                    self.set_last_error("Apify integration is not configured.")
+                    return []
+            else:
+                try:
+                    limit = settings.apify_results_limit or count
+                    posts = self._collect_posts_via_apify(apify_client, username, limit, known_post_ids)
+                except ApifyClientError as exc:
+                    self.set_last_error(f"Apify error: {exc}")
+                    posts = []
+                if mode == "apify" or posts:
+                    return posts
+
+        if not self._should_use_instaloader(settings):
             return posts
 
         if not self.loader:
-            if self._should_use_apify(settings) and apify_client:
-                return posts
-            raise RateLimitError("Instaloader is not available and Apify did not return results")
+            raise RateLimitError("Instaloader is not available")
 
         try:
             return self._collect_latest_posts(username, count, known_post_ids)
         except RateLimitError as exc:
-            if not self._should_use_apify(settings):
+            if mode == "instaloader" or not self._should_use_apify(settings):
                 self._schedule_backoff()
                 raise
             apify_client = self._get_apify_client(settings)
@@ -571,30 +602,37 @@ class MonitorService:
         since: datetime,
         known_post_ids: Optional[Set[str]],
     ) -> List[Dict]:
-        prefer_apify = self._should_use_apify(settings)
-        apify_client = self._get_apify_client(settings) if prefer_apify else None
+        mode = self._get_fetch_mode(settings)
         posts: List[Dict] = []
-        if apify_client:
-            try:
-                limit = settings.apify_results_limit or 30
-                posts = self._collect_posts_via_apify(apify_client, username, limit, known_post_ids)
-                posts = [p for p in posts if p.get("timestamp") and p["timestamp"] >= since]
-            except ApifyClientError as exc:
-                self.set_last_error(f"Apify error: {exc}")
-                posts = []
+        apify_client: Optional[ApifyClient] = None
 
-        if posts:
+        if mode == "apify" or (mode == "auto" and (not self._should_use_instaloader(settings) or not self.loader)):
+            apify_client = self._get_apify_client(settings)
+            if not apify_client:
+                if mode == "apify":
+                    self.set_last_error("Apify integration is not configured.")
+                    return []
+            else:
+                try:
+                    limit = settings.apify_results_limit or 30
+                    posts = self._collect_posts_via_apify(apify_client, username, limit, known_post_ids)
+                    posts = [p for p in posts if p.get("timestamp") and p["timestamp"] >= since]
+                except ApifyClientError as exc:
+                    self.set_last_error(f"Apify error: {exc}")
+                    posts = []
+                if mode == "apify" or posts:
+                    return posts
+
+        if not self._should_use_instaloader(settings):
             return posts
 
         if not self.loader:
-            if self._should_use_apify(settings) and apify_client:
-                return posts
-            raise RateLimitError("Instaloader is not available and Apify did not return results")
+            raise RateLimitError("Instaloader is not available")
 
         try:
             return self._collect_recent_posts(username, since, known_post_ids)
         except RateLimitError as exc:
-            if not self._should_use_apify(settings):
+            if mode == "instaloader" or not self._should_use_apify(settings):
                 self._schedule_backoff()
                 raise
             apify_client = self._get_apify_client(settings)

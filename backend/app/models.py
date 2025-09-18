@@ -15,11 +15,15 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    inspect,
+    text,
 )
-from sqlalchemy import inspect, text
 from sqlalchemy.orm import relationship
 
 from .database import Base
+
+
+DEFAULT_APIFY_ACTOR_ID = "shu8hvrXbJbY3Eb9W"
 
 
 class ClassificationModeEnum(str):
@@ -162,4 +166,3 @@ def ensure_default_settings(session) -> SystemSetting:
         session.commit()
         session.refresh(setting)
     return setting
-DEFAULT_APIFY_ACTOR_ID = "shu8hvrXbJbY3Eb9W"

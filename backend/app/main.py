@@ -146,6 +146,12 @@ async def update_system_settings(
     if payload.apify_results_limit is not None:
         settings.apify_results_limit = payload.apify_results_limit
         updated = True
+    if payload.instagram_fetcher is not None:
+        fetcher = payload.instagram_fetcher.lower()
+        if fetcher not in {"auto", "instaloader", "apify"}:
+            raise HTTPException(status_code=400, detail="Invalid Instagram fetcher selection")
+        settings.instagram_fetcher = fetcher
+        updated = True
     if updated:
         db.commit()
         db.refresh(settings)
@@ -263,10 +269,24 @@ async def fetch_latest_posts(post_count: int = 3, db: Session = Depends(get_db))
             }
 
         settings = ensure_default_settings(db)
-        if not monitor_service.loader and not monitor_service._should_use_apify(settings):
+        fetch_mode = (settings.instagram_fetcher or "auto").lower()
+        apify_ready = bool(settings.apify_api_token and settings.apify_actor_id)
+        has_loader = bool(monitor_service.loader)
+
+        if fetch_mode == "instaloader" and not has_loader:
             raise HTTPException(
                 status_code=503,
-                detail="Instagram fetching service is not available. Please check that Instaloader is installed or enable Apify integration."
+                detail="Instaloader session is not available. Upload a session file or switch to Apify mode."
+            )
+        if fetch_mode == "apify" and not apify_ready:
+            raise HTTPException(
+                status_code=503,
+                detail="Apify integration is not configured. Add a personal API token before using Apify mode."
+            )
+        if fetch_mode == "auto" and not has_loader and not apify_ready:
+            raise HTTPException(
+                status_code=503,
+                detail="No Instagram fetcher is ready. Provide an Instaloader session or Apify credentials."
             )
 
         stats = monitor_service.fetch_latest_posts_for_clubs(db, post_count)
@@ -300,22 +320,34 @@ async def fetch_latest_posts_stream(post_count: int = 3, db: Session = Depends(g
                 yield f"data: {json.dumps({'error': 'No active clubs found'})}\n\n"
                 return
 
-            # Check if Instaloader is available
-            if not monitor_service.loader:
-                yield f"data: {json.dumps({'error': 'Instagram fetching service is not available'})}\n\n"
+            settings = ensure_default_settings(db)
+            fetch_mode = (settings.instagram_fetcher or "auto").lower()
+            apify_ready = bool(settings.apify_api_token and settings.apify_actor_id)
+            has_loader = bool(monitor_service.loader)
+
+            if fetch_mode == "instaloader" and not has_loader:
+                yield f"data: {json.dumps({'error': 'Instaloader session is not available'})}\n\n"
+                return
+            if fetch_mode == "apify" and not apify_ready:
+                yield f"data: {json.dumps({'error': 'Apify integration is not configured'})}\n\n"
+                return
+            if fetch_mode == "auto" and not has_loader and not apify_ready:
+                yield f"data: {json.dumps({'error': 'Neither Instaloader nor Apify is ready to fetch'})}\n\n"
                 return
 
             if monitor_service._in_backoff():
-                wait_seconds = monitor_service.next_run_eta_seconds or monitor_service.rate_limit_backoff_minutes * 60
-                yield f"data: {json.dumps({'status': 'error', 'error': f'Instagram is throttling requests. Please retry in {max(wait_seconds // 60, 1)} minutes.'})}\n\n"
-                return
+                if fetch_mode != "instaloader" and apify_ready:
+                    monitor_service.clear_backoff()
+                else:
+                    wait_seconds = monitor_service.next_run_eta_seconds or monitor_service.rate_limit_backoff_minutes * 60
+                    yield f"data: {json.dumps({'status': 'error', 'error': f'Instagram is throttling requests. Please retry in {max(wait_seconds // 60, 1)} minutes.'})}\n\n"
+                    return
 
             yield f"data: {json.dumps({'status': 'starting', 'message': f'Starting to fetch {post_count} posts from {active_clubs_count} clubs'})}\n\n"
 
             stats = {"clubs": 0, "posts": 0, "classified": 0}
             monitor_service._last_run = datetime.utcnow()
 
-            settings = ensure_default_settings(db)
             global_auto = (settings.classification_mode or ClassificationModeEnum.MANUAL).lower() == ClassificationModeEnum.AUTO
 
             clubs = db.query(Club).filter(Club.active.is_(True)).all()
@@ -487,6 +519,7 @@ def _render_status(settings) -> MonitorStatus:
         next_run_eta_seconds=monitor_service.next_run_eta_seconds,
         classification_mode=settings.classification_mode,
         apify_enabled=settings.apify_enabled,
+        instagram_fetcher=settings.instagram_fetcher,
         last_error=monitor_service.last_error,
         session_username=settings.instaloader_username,
         session_uploaded_at=session_uploaded_iso,
@@ -497,5 +530,6 @@ def _render_status(settings) -> MonitorStatus:
 
 
 def _system_settings_out(settings) -> SystemSettingsOut:
-    setattr(settings, "has_apify_token", bool(getattr(settings, "apify_api_token", None)))
-    return SystemSettingsOut.from_orm(settings)
+    data = SystemSettingsOut.from_orm(settings)
+    data.has_apify_token = bool(getattr(settings, "apify_api_token", None))
+    return data

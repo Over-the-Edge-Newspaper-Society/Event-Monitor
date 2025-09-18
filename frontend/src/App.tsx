@@ -38,6 +38,7 @@ interface MonitorStatus {
   classification_mode: "manual" | "auto";
   last_error: string | null;
   apify_enabled: boolean;
+  instagram_fetcher: FetcherMode;
   session_username: string | null;
   session_uploaded_at: string | null;
   session_age_minutes: number | null;
@@ -91,9 +92,18 @@ interface SystemSettings {
   apify_actor_id?: string | null;
   apify_results_limit: number;
   has_apify_token: boolean;
+  instagram_fetcher: FetcherMode;
   created_at: string;
   updated_at: string;
 }
+
+type FetcherMode = "auto" | "instaloader" | "apify";
+
+const FETCHER_LABELS: Record<FetcherMode, string> = {
+  auto: "Auto (hybrid)",
+  instaloader: "Instaloader only",
+  apify: "Apify only",
+};
 
 const tabs = [
   { id: "setup", label: "Setup", icon: Settings },
@@ -135,6 +145,7 @@ const App = () => {
   const [isSavingApifySettings, setIsSavingApifySettings] = useState(false);
   const [isSavingApifyToken, setIsSavingApifyToken] = useState(false);
   const [isClearingApifyToken, setIsClearingApifyToken] = useState(false);
+  const [apifyFetcherMode, setApifyFetcherMode] = useState<FetcherMode>("auto");
 
   // Helper function to get the appropriate image URL
   const getImageUrl = (post: PostRecord): string | null => {
@@ -238,9 +249,11 @@ const App = () => {
     if (systemSettings) {
       setSessionUsernameInput(systemSettings.instaloader_username ?? "");
       setClubDelayInput(systemSettings.club_fetch_delay_seconds);
-      setApifyEnabledInput(systemSettings.apify_enabled);
       setApifyActorInput(systemSettings.apify_actor_id ?? "");
       setApifyResultsLimitInput(systemSettings.apify_results_limit);
+      const fetcher = systemSettings.instagram_fetcher ?? "auto";
+      setApifyFetcherMode(fetcher);
+      setApifyEnabledInput(fetcher === "apify" ? true : systemSettings.apify_enabled);
     }
   }, [systemSettings]);
 
@@ -400,6 +413,7 @@ const App = () => {
         apify_enabled: apifyEnabledInput,
         apify_results_limit: apifyResultsLimitInput,
         apify_actor_id: apifyActorInput.trim() || null,
+        instagram_fetcher: apifyFetcherMode,
       };
       const response = await fetch(`${API_BASE}/settings`, {
         method: "PATCH",
@@ -885,19 +899,40 @@ const App = () => {
                 </span>
               </div>
               <p className="text-sm text-gray-600">
-                Use Apify&apos;s Instagram Scraper as a fallback or replacement when Instaloader hits
-                rate limits. Provide your Apify actor ID and API token, then enable the integration to let the
-                monitor switch over automatically.
+                Choose whether to pull posts with Instaloader, Apify, or let the app switch automatically after
+                rate limits. Provide your Apify actor ID and API token if you plan to use Apify.
               </p>
               <div className="space-y-4">
+                <div>
+                  <label className="block text-sm font-medium text-gray-700">Fetcher preference</label>
+                  <select
+                    value={apifyFetcherMode}
+                    onChange={(event) => {
+                      const mode = event.target.value as FetcherMode;
+                      setApifyFetcherMode(mode);
+                      if (mode === "apify") {
+                        setApifyEnabledInput(true);
+                      }
+                    }}
+                    className="w-full sm:w-64 rounded-lg border border-gray-300 px-3 py-2 text-sm focus:border-purple-500 focus:outline-none focus:ring-2 focus:ring-purple-200"
+                  >
+                    <option value="auto">Auto (Instaloader first, Apify on block)</option>
+                    <option value="instaloader">Instaloader only</option>
+                    <option value="apify">Apify only</option>
+                  </select>
+                  <p className="text-xs text-gray-500 mt-1">
+                    Auto keeps Instaloader as primary; Apify is used only when needed.
+                  </p>
+                </div>
                 <label className="flex items-center gap-2 text-sm text-gray-700">
                   <input
                     type="checkbox"
                     checked={apifyEnabledInput}
                     onChange={(event) => setApifyEnabledInput(event.target.checked)}
-                    className="h-4 w-4 rounded border-gray-300 text-purple-600 focus:ring-purple-500"
+                    disabled={apifyFetcherMode === "apify"}
+                    className="h-4 w-4 rounded border-gray-300 text-purple-600 focus:ring-purple-500 disabled:opacity-60"
                   />
-                  Enable Apify Instagram Scraper
+                  Enable Apify fallback (used in auto mode)
                 </label>
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
                   <div>
@@ -1137,7 +1172,10 @@ const App = () => {
                     Workflow: {status ? (status.classification_mode === "auto" ? "AI" : "Manual") : "—"}
                   </p>
                   <p className="text-xs text-blue-500 mt-1">
-                    Apify: {status?.apify_enabled ? "Enabled" : "Disabled"}
+                    Fetcher: {status ? FETCHER_LABELS[status.instagram_fetcher] : "—"}
+                  </p>
+                  <p className="text-xs text-blue-500 mt-1">
+                    Apify fallback: {status?.apify_enabled ? "Enabled" : "Disabled"}
                   </p>
                 </div>
                 <div className="bg-purple-50 rounded-lg p-4">
