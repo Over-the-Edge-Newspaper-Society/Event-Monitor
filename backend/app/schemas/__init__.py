@@ -138,6 +138,19 @@ class MonitorStatus(BaseModel):
     next_run_eta_seconds: Optional[int] = None
     classification_mode: Optional[str] = Field(default=None, pattern="^(manual|auto)$")
     last_error: Optional[str] = None
+    apify_enabled: bool
+    instagram_fetcher: str = Field(pattern="^(auto|instaloader|apify)$")
+    session_username: Optional[str] = None
+    session_uploaded_at: Optional[str] = None
+    session_age_minutes: Optional[int] = None
+    is_rate_limited: bool = False
+    rate_limit_until: Optional[str] = None
+
+    @validator('session_uploaded_at', 'rate_limit_until', pre=True)
+    def format_iso_datetime(cls, v):
+        if isinstance(v, datetime):
+            return v.isoformat()
+        return v
 
 
 class CSVImportResponse(BaseModel):
@@ -161,6 +174,11 @@ class SystemSettingsOut(BaseModel):
     instaloader_username: Optional[str]
     instaloader_session_uploaded_at: Optional[str]
     club_fetch_delay_seconds: int
+    apify_enabled: bool
+    apify_actor_id: Optional[str]
+    apify_results_limit: int
+    has_apify_token: bool
+    instagram_fetcher: str = Field(pattern="^(auto|instaloader|apify)$")
     created_at: str
     updated_at: str
 
@@ -190,3 +208,11 @@ class SystemSettingsUpdate(BaseModel):
     classification_mode: Optional[str] = Field(default=None, pattern="^(manual|auto)$")
     monitor_interval_minutes: Optional[int] = Field(default=None, ge=1)
     club_fetch_delay_seconds: Optional[int] = Field(default=None, ge=0)
+    apify_enabled: Optional[bool] = None
+    apify_actor_id: Optional[str] = None
+    apify_results_limit: Optional[int] = Field(default=None, ge=1, le=1000)
+    instagram_fetcher: Optional[str] = Field(default=None, pattern="^(auto|instaloader|apify)$")
+
+
+class ApifyTokenUpdate(BaseModel):
+    token: Optional[str] = None

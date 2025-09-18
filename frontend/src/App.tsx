@@ -37,6 +37,12 @@ interface MonitorStatus {
   next_run_eta_seconds: number | null;
   classification_mode: "manual" | "auto";
   last_error: string | null;
+  apify_enabled: boolean;
+  session_username: string | null;
+  session_uploaded_at: string | null;
+  session_age_minutes: number | null;
+  is_rate_limited: boolean;
+  rate_limit_until: string | null;
 }
 
 interface ExtractedEvent {
@@ -81,6 +87,10 @@ interface SystemSettings {
   instaloader_username?: string | null;
   instaloader_session_uploaded_at?: string | null;
   club_fetch_delay_seconds: number;
+  apify_enabled: boolean;
+  apify_actor_id?: string | null;
+  apify_results_limit: number;
+  has_apify_token: boolean;
   created_at: string;
   updated_at: string;
 }
@@ -117,6 +127,14 @@ const App = () => {
   const [clubDelayInput, setClubDelayInput] = useState<number>(2);
   const [isSavingDelay, setIsSavingDelay] = useState(false);
   const [sessionFileKey, setSessionFileKey] = useState(() => Date.now().toString());
+  const [sessionCookieInput, setSessionCookieInput] = useState("");
+  const [apifyEnabledInput, setApifyEnabledInput] = useState(false);
+  const [apifyActorInput, setApifyActorInput] = useState("");
+  const [apifyResultsLimitInput, setApifyResultsLimitInput] = useState<number>(30);
+  const [apifyTokenInput, setApifyTokenInput] = useState("");
+  const [isSavingApifySettings, setIsSavingApifySettings] = useState(false);
+  const [isSavingApifyToken, setIsSavingApifyToken] = useState(false);
+  const [isClearingApifyToken, setIsClearingApifyToken] = useState(false);
 
   // Helper function to get the appropriate image URL
   const getImageUrl = (post: PostRecord): string | null => {
@@ -220,6 +238,9 @@ const App = () => {
     if (systemSettings) {
       setSessionUsernameInput(systemSettings.instaloader_username ?? "");
       setClubDelayInput(systemSettings.club_fetch_delay_seconds);
+      setApifyEnabledInput(systemSettings.apify_enabled);
+      setApifyActorInput(systemSettings.apify_actor_id ?? "");
+      setApifyResultsLimitInput(systemSettings.apify_results_limit);
     }
   }, [systemSettings]);
 
@@ -316,6 +337,40 @@ const App = () => {
     }
   };
 
+  const handleSessionCookieSubmit = async () => {
+    if (!sessionUsernameInput.trim()) {
+      handleApiError("Enter the Instagram username that owns the cookie before saving.");
+      return;
+    }
+    if (!sessionCookieInput.trim()) {
+      handleApiError("Paste a session cookie string first.");
+      return;
+    }
+    try {
+      setIsUploadingSession(true);
+      const form = new FormData();
+      form.append("username", sessionUsernameInput.trim());
+      form.append("session_cookie", sessionCookieInput.trim());
+      const response = await fetch(`${API_BASE}/settings/session`, {
+        method: "POST",
+        body: form,
+      });
+      if (!response.ok) {
+        const text = await response.text();
+        throw new Error(text || "Failed to save session cookie");
+      }
+      const data: SystemSettings = await response.json();
+      setSystemSettings(data);
+      setSessionCookieInput("");
+      await fetchStatus();
+      showSuccess("Instagram session cookie stored. Refresh the monitor if it was paused.");
+    } catch (err) {
+      handleApiError((err as Error).message);
+    } finally {
+      setIsUploadingSession(false);
+    }
+  };
+
   const handleRemoveSession = async () => {
     if (!systemSettings?.instaloader_username) return;
     try {
@@ -335,6 +390,83 @@ const App = () => {
       handleApiError((err as Error).message);
     } finally {
       setIsRemovingSession(false);
+    }
+  };
+
+  const handleSaveApifySettings = async () => {
+    try {
+      setIsSavingApifySettings(true);
+      const payload: Record<string, unknown> = {
+        apify_enabled: apifyEnabledInput,
+        apify_results_limit: apifyResultsLimitInput,
+        apify_actor_id: apifyActorInput.trim() || null,
+      };
+      const response = await fetch(`${API_BASE}/settings`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      if (!response.ok) {
+        const text = await response.text();
+        throw new Error(text || "Failed to update Apify settings");
+      }
+      const data: SystemSettings = await response.json();
+      setSystemSettings(data);
+      await fetchStatus();
+      showSuccess("Updated Apify integration settings.");
+    } catch (err) {
+      handleApiError((err as Error).message);
+    } finally {
+      setIsSavingApifySettings(false);
+    }
+  };
+
+  const handleSaveApifyToken = async () => {
+    if (!apifyTokenInput.trim()) {
+      handleApiError("Paste an Apify API token before saving.");
+      return;
+    }
+    try {
+      setIsSavingApifyToken(true);
+      const response = await fetch(`${API_BASE}/settings/apify/token`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ token: apifyTokenInput.trim() }),
+      });
+      if (!response.ok) {
+        const text = await response.text();
+        throw new Error(text || "Failed to store Apify token");
+      }
+      const data: SystemSettings = await response.json();
+      setSystemSettings(data);
+      setApifyTokenInput("");
+      await fetchStatus();
+      showSuccess("Saved Apify API token.");
+    } catch (err) {
+      handleApiError((err as Error).message);
+    } finally {
+      setIsSavingApifyToken(false);
+    }
+  };
+
+  const handleClearApifyToken = async () => {
+    try {
+      setIsClearingApifyToken(true);
+      const response = await fetch(`${API_BASE}/settings/apify/token`, {
+        method: "DELETE",
+      });
+      if (!response.ok) {
+        const text = await response.text();
+        throw new Error(text || "Failed to remove Apify token");
+      }
+      const data: SystemSettings = await response.json();
+      setSystemSettings(data);
+      await fetchStatus();
+      showSuccess("Removed Apify API token.");
+    } catch (err) {
+      handleApiError((err as Error).message);
+    } finally {
+      setIsClearingApifyToken(false);
     }
   };
 
@@ -581,6 +713,32 @@ const App = () => {
     return date.toLocaleString();
   };
 
+  const describeMinutes = (minutes: number | null) => {
+    if (minutes == null) return "—";
+    if (minutes < 60) {
+      return `${minutes} min`;
+    }
+    const minutesInDay = 60 * 24;
+    const days = Math.floor(minutes / minutesInDay);
+    const remainingAfterDays = minutes % minutesInDay;
+    const hours = Math.floor(remainingAfterDays / 60);
+    const remainingMinutes = remainingAfterDays % 60;
+
+    if (days > 0) {
+      const dayPart = `${days} d`;
+      if (hours > 0) {
+        return remainingMinutes > 0 ? `${dayPart} ${hours} h ${remainingMinutes} min` : `${dayPart} ${hours} h`;
+      }
+      return remainingMinutes > 0 ? `${dayPart} ${remainingMinutes} min` : dayPart;
+    }
+
+    if (hours > 0) {
+      return remainingMinutes > 0 ? `${hours} h ${remainingMinutes} min` : `${hours} h`;
+    }
+
+    return `${minutes} min`;
+  };
+
   return (
     <div className="min-h-screen bg-slate-100">
       <div className="max-w-7xl mx-auto px-4 py-8 space-y-6">
@@ -719,6 +877,108 @@ const App = () => {
             <section className="bg-white rounded-xl shadow-sm p-6 space-y-4">
               <div className="flex items-center justify-between">
                 <h2 className="text-xl font-semibold flex items-center gap-2">
+                  <Zap className="h-5 w-5 text-purple-600" />
+                  Apify Integration
+                </h2>
+                <span className="text-xs text-gray-500">
+                  {systemSettings?.apify_enabled ? "Enabled" : "Disabled"}
+                </span>
+              </div>
+              <p className="text-sm text-gray-600">
+                Use Apify&apos;s Instagram Scraper as a fallback or replacement when Instaloader hits
+                rate limits. Provide your Apify actor ID and API token, then enable the integration to let the
+                monitor switch over automatically.
+              </p>
+              <div className="space-y-4">
+                <label className="flex items-center gap-2 text-sm text-gray-700">
+                  <input
+                    type="checkbox"
+                    checked={apifyEnabledInput}
+                    onChange={(event) => setApifyEnabledInput(event.target.checked)}
+                    className="h-4 w-4 rounded border-gray-300 text-purple-600 focus:ring-purple-500"
+                  />
+                  Enable Apify Instagram Scraper
+                </label>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700">Actor ID</label>
+                    <input
+                      type="text"
+                      value={apifyActorInput}
+                      onChange={(event) => setApifyActorInput(event.target.value)}
+                      placeholder="shu8hvrXbJbY3Eb9W"
+                      className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:border-purple-500 focus:outline-none focus:ring-2 focus:ring-purple-200"
+                    />
+                    <p className="text-xs text-gray-500 mt-1">Use the actor ID from Apify (default scraper shown).</p>
+                  </div>
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700">Results limit per club</label>
+                    <input
+                      type="number"
+                      min={1}
+                      max={1000}
+                      value={apifyResultsLimitInput}
+                      onChange={(event) => {
+                        const value = Number(event.target.value);
+                        if (!Number.isNaN(value)) {
+                          setApifyResultsLimitInput(Math.min(Math.max(1, Math.round(value)), 1000));
+                        }
+                      }}
+                      className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:border-purple-500 focus:outline-none focus:ring-2 focus:ring-purple-200"
+                    />
+                    <p className="text-xs text-gray-500 mt-1">How many posts to request from Apify when invoked.</p>
+                  </div>
+                </div>
+                <div className="flex flex-wrap items-center gap-3">
+                  <button
+                    onClick={handleSaveApifySettings}
+                    disabled={isSavingApifySettings}
+                    className="px-4 py-2 rounded-lg bg-purple-600 hover:bg-purple-700 text-white text-sm font-medium disabled:bg-purple-400"
+                  >
+                    {isSavingApifySettings ? "Saving..." : "Save Apify settings"}
+                  </button>
+                  <span className="text-xs text-gray-500">
+                    Actor and limit updates apply immediately to the next monitor run.
+                  </span>
+                </div>
+
+                <div className="border-t border-gray-200 pt-4 space-y-3">
+                  <label className="block text-sm font-medium text-gray-700">Apify personal API token</label>
+                  <input
+                    type="password"
+                    value={apifyTokenInput}
+                    onChange={(event) => setApifyTokenInput(event.target.value)}
+                    placeholder="apify_api_... (from Personal API tokens)"
+                    className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:border-purple-500 focus:outline-none focus:ring-2 focus:ring-purple-200"
+                  />
+                  <div className="flex flex-wrap items-center gap-3">
+                    <button
+                      onClick={handleSaveApifyToken}
+                      disabled={isSavingApifyToken}
+                      className="px-4 py-2 rounded-lg bg-green-600 hover:bg-green-700 text-white text-sm font-medium disabled:bg-green-400"
+                    >
+                      {isSavingApifyToken ? "Saving token..." : "Save token"}
+                    </button>
+                    <button
+                      onClick={handleClearApifyToken}
+                      disabled={!systemSettings?.has_apify_token || isClearingApifyToken}
+                      className="px-4 py-2 rounded-lg border border-red-200 text-sm font-medium text-red-600 hover:bg-red-50 disabled:border-gray-200 disabled:text-gray-400"
+                    >
+                      {isClearingApifyToken ? "Removing..." : "Remove token"}
+                    </button>
+                    <span className="text-xs text-gray-500">
+                      {systemSettings?.has_apify_token
+                        ? "Token stored securely."
+                        : "Open Apify Console → Integrations → Personal API tokens to generate one."}
+                    </span>
+                  </div>
+                </div>
+              </div>
+            </section>
+
+            <section className="bg-white rounded-xl shadow-sm p-6 space-y-4">
+              <div className="flex items-center justify-between">
+                <h2 className="text-xl font-semibold flex items-center gap-2">
                   <Settings className="h-5 w-5 text-purple-600" />
                   Instagram Login
                 </h2>
@@ -763,12 +1023,48 @@ const App = () => {
                     {isRemovingSession ? "Removing..." : "Remove session"}
                   </button>
                 </div>
-                {systemSettings?.instaloader_session_uploaded_at && (
-                  <p className="text-xs text-gray-500">
-                    Uploaded {formatTimestamp(systemSettings.instaloader_session_uploaded_at ?? null)}
-                  </p>
-                )}
+                <p className="text-xs text-gray-500">
+                  Upload the <code>.session</code> file generated by Instaloader or paste your browser cookies below.
+                </p>
+                <div className="space-y-2">
+                  <label className="block text-sm font-medium text-gray-700">Session cookie string</label>
+                  <textarea
+                    value={sessionCookieInput}
+                    onChange={(event) => setSessionCookieInput(event.target.value)}
+                    placeholder="sessionid=...; csrftoken=...; ds_user_id=..."
+                    rows={3}
+                    className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:border-purple-500 focus:outline-none focus:ring-2 focus:ring-purple-200"
+                  />
+                </div>
+                <div className="flex flex-col sm:flex-row sm:items-center sm:gap-3 gap-2">
+                  <button
+                    onClick={handleSessionCookieSubmit}
+                    disabled={isUploadingSession || !sessionCookieInput.trim()}
+                    className="px-4 py-2 rounded-lg bg-purple-600 hover:bg-purple-700 text-white text-sm font-medium disabled:bg-purple-400"
+                  >
+                    {isUploadingSession ? "Saving..." : "Save cookie string"}
+                  </button>
+                  <span className="text-xs text-gray-500">
+                    Paste the cookie header from dev tools; only keys like <code>sessionid</code> are stored.
+                  </span>
+                </div>
               </div>
+              {status?.session_username && (
+                <div className="bg-gray-50 border border-gray-200 rounded-lg p-4 text-sm text-gray-600 space-y-1">
+                  <p className="font-medium text-gray-700">Active session: @{status?.session_username}</p>
+                  <p>
+                    Uploaded {formatTimestamp(status?.session_uploaded_at ?? null)}
+                    {status?.session_age_minutes != null
+                      ? ` (${describeMinutes(status?.session_age_minutes)} ago)`
+                      : ""}
+                  </p>
+                  {status?.is_rate_limited && status?.rate_limit_until && (
+                    <p className="text-xs text-red-600">
+                      Rate limited until {formatTimestamp(status?.rate_limit_until ?? null)}
+                    </p>
+                  )}
+                </div>
+              )}
             </section>
 
             <section className="bg-white rounded-xl shadow-sm p-6 space-y-4">
@@ -840,6 +1136,9 @@ const App = () => {
                   <p className="text-xs text-blue-500 mt-1">
                     Workflow: {status ? (status.classification_mode === "auto" ? "AI" : "Manual") : "—"}
                   </p>
+                  <p className="text-xs text-blue-500 mt-1">
+                    Apify: {status?.apify_enabled ? "Enabled" : "Disabled"}
+                  </p>
                 </div>
                 <div className="bg-purple-50 rounded-lg p-4">
                   <p className="text-sm text-purple-900">Last Run</p>
@@ -847,6 +1146,11 @@ const App = () => {
                   <p className="text-xs text-purple-500 mt-2">
                     Next run in {status?.next_run_eta_seconds ? `${Math.round(status.next_run_eta_seconds / 60)} min` : "—"}
                   </p>
+                  {status?.is_rate_limited && status?.rate_limit_until && (
+                    <p className="text-xs text-red-600 mt-1">
+                      Backing off until {formatTimestamp(status?.rate_limit_until ?? null)}
+                    </p>
+                  )}
                 </div>
                 <div className="bg-green-50 rounded-lg p-4">
                   <p className="text-sm text-green-900">Activity</p>

@@ -16,6 +16,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
 )
+from sqlalchemy import inspect, text
 from sqlalchemy.orm import relationship
 
 from .database import Base
@@ -85,23 +86,51 @@ class SystemSetting(Base):
 
     id = Column(Integer, primary_key=True)
     monitoring_enabled = Column(Boolean, default=False, nullable=False)
-    monitor_interval_minutes = Column(Integer, default=30, nullable=False)
+    monitor_interval_minutes = Column(Integer, default=45, nullable=False)
     classification_mode = Column(String(20), default=ClassificationModeEnum.AUTO, nullable=False)
     instaloader_username = Column(String(255), nullable=True)
     instaloader_session_uploaded_at = Column(DateTime, nullable=True)
     club_fetch_delay_seconds = Column(Integer, default=2, nullable=False)
+    apify_enabled = Column(Boolean, default=False, nullable=False)
+    apify_actor_id = Column(String(255), default=DEFAULT_APIFY_ACTOR_ID, nullable=True)
+    apify_results_limit = Column(Integer, default=30, nullable=False)
+    apify_api_token = Column(String(512), nullable=True)
+    instagram_fetcher = Column(String(20), default="auto", nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
 
 
 def ensure_default_settings(session) -> SystemSetting:
+    bind = session.get_bind()
+    inspector = inspect(bind)
+    columns = {col["name"] for col in inspector.get_columns("system_settings")}
+
+    alter_statements = []
+    if "apify_enabled" not in columns:
+        alter_statements.append("ADD COLUMN apify_enabled BOOLEAN DEFAULT 0 NOT NULL")
+    if "apify_actor_id" not in columns:
+        alter_statements.append(f"ADD COLUMN apify_actor_id VARCHAR(255) DEFAULT '{DEFAULT_APIFY_ACTOR_ID}'")
+    if "apify_results_limit" not in columns:
+        alter_statements.append("ADD COLUMN apify_results_limit INTEGER DEFAULT 30 NOT NULL")
+    if "apify_api_token" not in columns:
+        alter_statements.append("ADD COLUMN apify_api_token VARCHAR(512)")
+    if "instagram_fetcher" not in columns:
+        alter_statements.append("ADD COLUMN instagram_fetcher VARCHAR(20) DEFAULT 'auto' NOT NULL")
+
+    if alter_statements:
+        with bind.connect() as conn:
+            for statement in alter_statements:
+                conn.execute(text(f"ALTER TABLE system_settings {statement}"))
+            conn.commit()
+
     setting: Optional[SystemSetting] = session.query(SystemSetting).order_by(SystemSetting.id).first()
     if setting is None:
         setting = SystemSetting(
             monitoring_enabled=False,
-            monitor_interval_minutes=30,
+            monitor_interval_minutes=45,
             classification_mode=ClassificationModeEnum.AUTO,
             club_fetch_delay_seconds=2,
+            apify_actor_id=DEFAULT_APIFY_ACTOR_ID,
         )
         session.add(setting)
         session.commit()
@@ -109,7 +138,7 @@ def ensure_default_settings(session) -> SystemSetting:
     else:
         updated = False
         if setting.monitor_interval_minutes is None:
-            setting.monitor_interval_minutes = 30
+            setting.monitor_interval_minutes = 45
             updated = True
         if not getattr(setting, "classification_mode", None):
             setting.classification_mode = ClassificationModeEnum.AUTO
@@ -117,7 +146,20 @@ def ensure_default_settings(session) -> SystemSetting:
         if setting.club_fetch_delay_seconds is None:
             setting.club_fetch_delay_seconds = 2
             updated = True
-        if updated:
-            session.commit()
-            session.refresh(setting)
+        if not getattr(setting, "apify_actor_id", None):
+            setting.apify_actor_id = DEFAULT_APIFY_ACTOR_ID
+            updated = True
+        if setting.apify_results_limit is None:
+            setting.apify_results_limit = 30
+            updated = True
+        if setting.apify_enabled is None:
+            setting.apify_enabled = False
+            updated = True
+        if not getattr(setting, "instagram_fetcher", None):
+            setting.instagram_fetcher = "auto"
+            updated = True
+    if updated:
+        session.commit()
+        session.refresh(setting)
     return setting
+DEFAULT_APIFY_ACTOR_ID = "shu8hvrXbJbY3Eb9W"

@@ -25,6 +25,7 @@ from .schemas import (
     StatsOut,
     SystemSettingsOut,
     SystemSettingsUpdate,
+    ApifyTokenUpdate,
 )
 from .services.monitor import monitor_service, RateLimitError
 from .utils.csv_loader import import_clubs_from_csv
@@ -112,7 +113,7 @@ async def monitor_stop(db: Session = Depends(get_db)) -> MonitorStatus:
 @app.get("/settings", response_model=SystemSettingsOut)
 async def get_system_settings(db: Session = Depends(get_db)) -> SystemSettingsOut:
     settings = ensure_default_settings(db)
-    return SystemSettingsOut.from_orm(settings)
+    return _system_settings_out(settings)
 
 
 @app.patch("/settings", response_model=SystemSettingsOut)
@@ -135,36 +136,94 @@ async def update_system_settings(
             raise HTTPException(status_code=400, detail="Club fetch delay cannot be negative")
         settings.club_fetch_delay_seconds = payload.club_fetch_delay_seconds
         updated = True
+    if payload.apify_enabled is not None:
+        settings.apify_enabled = payload.apify_enabled
+        updated = True
+    if payload.apify_actor_id is not None:
+        cleaned_actor = payload.apify_actor_id.strip() or None
+        settings.apify_actor_id = cleaned_actor
+        updated = True
+    if payload.apify_results_limit is not None:
+        settings.apify_results_limit = payload.apify_results_limit
+        updated = True
     if updated:
         db.commit()
         db.refresh(settings)
         monitor_service.clear_last_error()
-    return SystemSettingsOut.from_orm(settings)
+    return _system_settings_out(settings)
+
+
+@app.post("/settings/apify/token", response_model=SystemSettingsOut)
+async def update_apify_token(
+    payload: ApifyTokenUpdate,
+    db: Session = Depends(get_db),
+) -> SystemSettingsOut:
+    settings = ensure_default_settings(db)
+    token = (payload.token or "").strip()
+    settings.apify_api_token = token or None
+    db.commit()
+    db.refresh(settings)
+    monitor_service.clear_last_error()
+    return _system_settings_out(settings)
+
+
+@app.delete("/settings/apify/token", response_model=SystemSettingsOut)
+async def clear_apify_token(db: Session = Depends(get_db)) -> SystemSettingsOut:
+    settings = ensure_default_settings(db)
+    settings.apify_api_token = None
+    db.commit()
+    db.refresh(settings)
+    monitor_service.clear_last_error()
+    return _system_settings_out(settings)
 
 
 @app.post("/settings/session", response_model=SystemSettingsOut)
 async def upload_instagram_session(
     username: str = Form(...),
-    file: UploadFile = File(...),
+    file: Optional[UploadFile] = File(None),
+    session_cookie: Optional[str] = Form(None),
     db: Session = Depends(get_db),
 ) -> SystemSettingsOut:
     if not monitor_service.loader:
         raise HTTPException(status_code=503, detail="Instaloader is not available on this server")
 
-    content = await file.read()
-    if not content:
-        raise HTTPException(status_code=400, detail="Session file was empty")
-
-    INSTALOADER_SESSION_PATH.parent.mkdir(parents=True, exist_ok=True)
-    INSTALOADER_SESSION_PATH.write_bytes(content)
-
     settings = ensure_default_settings(db)
     settings.instaloader_username = username
     settings.instaloader_session_uploaded_at = datetime.utcnow()
 
+    monitor_service.session_file_path = INSTALOADER_SESSION_PATH
+
+    try:
+        if session_cookie and session_cookie.strip():
+            cookies = monitor_service.parse_cookie_input(session_cookie)
+            if not cookies.get("sessionid"):
+                raise HTTPException(status_code=400, detail="Session cookie must include a 'sessionid' value")
+            monitor_service.save_session_from_cookies(username, cookies)
+        elif file is not None:
+            content = await file.read()
+            if not content:
+                raise HTTPException(status_code=400, detail="Session file was empty")
+
+            INSTALOADER_SESSION_PATH.parent.mkdir(parents=True, exist_ok=True)
+            INSTALOADER_SESSION_PATH.write_bytes(content)
+        else:
+            raise HTTPException(status_code=400, detail="Provide a session file or paste a session cookie string")
+    except HTTPException:
+        db.rollback()
+        raise
+    except ValueError as exc:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=str(exc))
+    try:
+        monitor_service.clear_backoff()
+        monitor_service.clear_last_error()
+    except Exception:
+        pass
+
     try:
         monitor_service.session_file_path = INSTALOADER_SESSION_PATH
-        monitor_service.configure_from_settings(settings)
+        if not (session_cookie and session_cookie.strip()):
+            monitor_service.configure_from_settings(settings)
     except Exception as exc:
         INSTALOADER_SESSION_PATH.unlink(missing_ok=True)
         db.rollback()
@@ -173,19 +232,20 @@ async def upload_instagram_session(
     db.commit()
     db.refresh(settings)
     monitor_service.clear_last_error()
-    return SystemSettingsOut.from_orm(settings)
+    return _system_settings_out(settings)
 
 
 @app.delete("/settings/session", response_model=SystemSettingsOut)
 async def remove_instagram_session(db: Session = Depends(get_db)) -> SystemSettingsOut:
     settings = ensure_default_settings(db)
     monitor_service.remove_session()
+    monitor_service.clear_backoff()
     settings.instaloader_username = None
     settings.instaloader_session_uploaded_at = None
     db.commit()
     db.refresh(settings)
     monitor_service.clear_last_error()
-    return SystemSettingsOut.from_orm(settings)
+    return _system_settings_out(settings)
 
 
 @app.post("/monitor/fetch-latest")
@@ -202,11 +262,11 @@ async def fetch_latest_posts(post_count: int = 3, db: Session = Depends(get_db))
                 "error": "Please activate some clubs in the Setup tab before fetching posts."
             }
 
-        # Check if Instaloader is available
-        if not monitor_service.loader:
+        settings = ensure_default_settings(db)
+        if not monitor_service.loader and not monitor_service._should_use_apify(settings):
             raise HTTPException(
                 status_code=503,
-                detail="Instagram fetching service is not available. Please check that Instaloader is installed."
+                detail="Instagram fetching service is not available. Please check that Instaloader is installed or enable Apify integration."
             )
 
         stats = monitor_service.fetch_latest_posts_for_clubs(db, post_count)
@@ -245,6 +305,11 @@ async def fetch_latest_posts_stream(post_count: int = 3, db: Session = Depends(g
                 yield f"data: {json.dumps({'error': 'Instagram fetching service is not available'})}\n\n"
                 return
 
+            if monitor_service._in_backoff():
+                wait_seconds = monitor_service.next_run_eta_seconds or monitor_service.rate_limit_backoff_minutes * 60
+                yield f"data: {json.dumps({'status': 'error', 'error': f'Instagram is throttling requests. Please retry in {max(wait_seconds // 60, 1)} minutes.'})}\n\n"
+                return
+
             yield f"data: {json.dumps({'status': 'starting', 'message': f'Starting to fetch {post_count} posts from {active_clubs_count} clubs'})}\n\n"
 
             stats = {"clubs": 0, "posts": 0, "classified": 0}
@@ -261,10 +326,17 @@ async def fetch_latest_posts_stream(post_count: int = 3, db: Session = Depends(g
 
                 stats["clubs"] += 1
                 try:
-                    posts = monitor_service._collect_latest_posts(club.username, post_count)
+                    known_ids = monitor_service._get_recent_post_ids(db, club.id)
+                    posts = monitor_service._fetch_latest_posts_for_club(
+                        settings,
+                        club.username,
+                        post_count,
+                        known_ids,
+                    )
                 except RateLimitError as exc:
                     db.rollback()
                     monitor_service.set_last_error(str(exc))
+                    monitor_service._schedule_backoff()
                     yield f"data: {json.dumps({'status': 'error', 'error': str(exc) or 'Instagram temporarily blocked our requests. Please try again later.'})}\n\n"
                     return
 
@@ -398,11 +470,32 @@ async def stats(db: Session = Depends(get_db)) -> StatsOut:
 
 def _render_status(settings) -> MonitorStatus:
     last_run = monitor_service.last_run.isoformat() if monitor_service.last_run else None
+    rate_limit_until = monitor_service.rate_limit_until
+    rate_limit_until_iso = rate_limit_until.isoformat() if rate_limit_until else None
+    now = datetime.utcnow()
+    uploaded_at = settings.instaloader_session_uploaded_at
+    session_uploaded_iso = uploaded_at.isoformat() if uploaded_at else None
+    session_age_minutes = None
+    if uploaded_at:
+        delta = now - uploaded_at
+        session_age_minutes = max(int(delta.total_seconds() // 60), 0)
+    is_rate_limited = bool(rate_limit_until and rate_limit_until > now)
     return MonitorStatus(
         monitoring_enabled=settings.monitoring_enabled,
         monitor_interval_minutes=settings.monitor_interval_minutes,
         last_run=last_run,
         next_run_eta_seconds=monitor_service.next_run_eta_seconds,
         classification_mode=settings.classification_mode,
+        apify_enabled=settings.apify_enabled,
         last_error=monitor_service.last_error,
+        session_username=settings.instaloader_username,
+        session_uploaded_at=session_uploaded_iso,
+        session_age_minutes=session_age_minutes,
+        is_rate_limited=is_rate_limited,
+        rate_limit_until=rate_limit_until_iso,
     )
+
+
+def _system_settings_out(settings) -> SystemSettingsOut:
+    setattr(settings, "has_apify_token", bool(getattr(settings, "apify_api_token", None)))
+    return SystemSettingsOut.from_orm(settings)
