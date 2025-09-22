@@ -2093,7 +2093,7 @@ const App = () => {
         )}
 
         {activeTab === "classify" && (
-          <div className="grid grid-cols-1 xl:grid-cols-[2fr,1fr] gap-6">
+          <div className="space-y-6">
             <section className="bg-white rounded-xl shadow-sm p-6">
               <div className="flex items-center justify-between mb-4">
                 <h2 className="text-xl font-semibold">Review Queue</h2>
@@ -2105,7 +2105,7 @@ const App = () => {
                   All caught up—no posts awaiting review.
                 </div>
               ) : (
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-4 max-h-[32rem] overflow-y-auto pr-2">
+                <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
                   {reviewQueue.map(({ post, source }) => {
                     const imageUrl = getImageUrl(post);
                     const badgeLabel = source === "ai"
@@ -2197,13 +2197,34 @@ const App = () => {
               )}
             </section>
 
-            <section className="bg-white rounded-xl shadow-sm p-6 space-y-3">
-              <h2 className="text-xl font-semibold">Review Summary</h2>
-              <div className="space-y-2 text-sm text-gray-600">
-                <p>Manual posts waiting: {reviewQueue.filter((item) => item.source === "manual").length}</p>
-                <p>AI suggestions: {reviewQueue.filter((item) => item.source === "ai").length}</p>
-                <p>Rejected posts: {posts.filter((post) => post.is_event_poster === false).length}</p>
-                <p>Ready for extraction: {eventPosts.length}</p>
+            <section className="bg-white rounded-xl shadow-sm p-6 space-y-4">
+              <div className="flex items-center justify-between">
+                <h2 className="text-xl font-semibold">Review Summary</h2>
+                <span className="text-xs text-gray-400">Updated {new Date().toLocaleTimeString()}</span>
+              </div>
+              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 text-sm text-gray-600">
+                <div className="rounded-lg border border-gray-200 bg-gray-50 p-4">
+                  <p className="font-semibold text-gray-800">Manual pending</p>
+                  <p className="text-2xl font-bold text-purple-600">
+                    {reviewQueue.filter((item) => item.source === "manual").length}
+                  </p>
+                </div>
+                <div className="rounded-lg border border-gray-200 bg-gray-50 p-4">
+                  <p className="font-semibold text-gray-800">AI suggestions</p>
+                  <p className="text-2xl font-bold text-purple-600">
+                    {reviewQueue.filter((item) => item.source === "ai").length}
+                  </p>
+                </div>
+                <div className="rounded-lg border border-gray-200 bg-gray-50 p-4">
+                  <p className="font-semibold text-gray-800">Rejected posts</p>
+                  <p className="text-2xl font-bold text-purple-600">
+                    {posts.filter((post) => post.is_event_poster === false).length}
+                  </p>
+                </div>
+                <div className="rounded-lg border border-gray-200 bg-gray-50 p-4">
+                  <p className="font-semibold text-gray-800">Ready for export</p>
+                  <p className="text-2xl font-bold text-purple-600">{eventPosts.length}</p>
+                </div>
               </div>
               <p className="text-xs text-gray-500">
                 AI suggestions stay in this queue until you attach event JSON or undo them. Manual posts disappear once
