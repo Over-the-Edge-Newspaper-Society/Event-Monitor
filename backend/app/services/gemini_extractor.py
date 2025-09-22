@@ -178,7 +178,12 @@ def load_post_image(post: Post) -> Tuple[bytes, str, Optional[str]]:
     return local_path.read_bytes(), _guess_mime_from_filename(local_path.name), downloaded_filename
 
 
-def extract_event_json(image_bytes: bytes, mime_type: str, api_key: str) -> Dict[str, Any]:
+def extract_event_json(
+    image_bytes: bytes,
+    mime_type: str,
+    api_key: str,
+    caption: Optional[str] = None,
+) -> Dict[str, Any]:
     model = _ensure_model(api_key)
     image_part = {
         "inline_data": {
@@ -186,10 +191,19 @@ def extract_event_json(image_bytes: bytes, mime_type: str, api_key: str) -> Dict
             "mime_type": mime_type,
         }
     }
-    text_part = {"text": GEMINI_PROMPT}
+    prompt_part = {"text": GEMINI_PROMPT}
+    caption_part = None
+    if caption:
+        caption_part = {
+            "text": f"Instagram caption (additional context):\n{caption}"
+        }
+
+    parts = [image_part, prompt_part]
+    if caption_part:
+        parts.append(caption_part)
 
     try:
-        response = model.generate_content([image_part, text_part])
+        response = model.generate_content(parts)
     except Exception as exc:  # pragma: no cover - network/API failures
         raise GeminiExtractionError(f"Gemini API error: {exc}") from exc
 
@@ -215,7 +229,7 @@ def extract_event_data_for_post(post: Post, api_key: str) -> Tuple[Dict[str, Any
     """Extract event JSON for a post and return payload plus optional new local filename."""
 
     image_bytes, mime_type, downloaded_filename = load_post_image(post)
-    result = extract_event_json(image_bytes, mime_type, api_key)
+    result = extract_event_json(image_bytes, mime_type, api_key, caption=post.caption)
     return result, downloaded_filename
 
 

@@ -274,3 +274,24 @@ class ClubFetchLatestResponse(BaseModel):
     fetched: int
     created: int
     message: str
+
+
+class EventExportItem(BaseModel):
+    db_id: str
+    post_id: int
+    post_instagram_id: str
+    post_url: str
+    post_timestamp: str
+    post_caption: Optional[str]
+    post_image_url: Optional[str]
+    payload: Any
+    extraction_confidence: Optional[float]
+
+
+class ClubEventsExport(BaseModel):
+    club_id: int
+    club_name: str
+    club_username: str
+    club_profile_url: str
+    platform: str = "instagram"
+    events: List[EventExportItem]

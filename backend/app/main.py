@@ -7,7 +7,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Set
 
-from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -41,6 +41,8 @@ from .schemas import (
     DeletePostResponse,
     ApifyImportStats,
     GeminiApiKeyUpdate,
+    ClubEventsExport,
+    EventExportItem,
 )
 from .services.gemini_extractor import (
     GeminiApiKeyMissing,
@@ -52,6 +54,7 @@ from .services.gemini_extractor import (
 from .services.monitor import monitor_service, RateLimitError, ApifyIntegrationError
 from .utils.apify_client import ApifyRunTimeoutError
 from .utils.csv_loader import import_clubs_from_csv
+from .utils.image_downloader import get_image_url
 
 app = FastAPI(title="Instagram Event Monitor")
 
@@ -668,6 +671,7 @@ async def list_posts(status: Optional[str] = None, db: Session = Depends(get_db)
 async def classify_post(
     post_id: int,
     payload: PostClassificationRequest,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
 ) -> PostOut:
     post = db.query(Post).options(joinedload(Post.club)).filter(Post.id == post_id).one_or_none()
@@ -678,13 +682,15 @@ async def classify_post(
     post.classification_confidence = payload.confidence
     post.manual_review_notes = payload.notes
 
-    if payload.is_event_poster:
-        try:
-            auto_extract_for_post(post, settings, overwrite=False)
-        except Exception as exc:  # pragma: no cover - safeguard against unexpected errors
-            print(f"Gemini auto extraction failed during manual classification for post {post.instagram_id}: {exc}")
+    should_schedule_auto_extract = False
+    if payload.is_event_poster and settings.gemini_auto_extract:
+        gemini_api_key = (settings.gemini_api_key or "").strip() or os.getenv("GEMINI_API_KEY", "").strip()
+        if gemini_api_key and not post.extracted_event:
+            should_schedule_auto_extract = True
     db.commit()
     db.refresh(post)
+    if should_schedule_auto_extract:
+        background_tasks.add_task(_run_gemini_auto_extract, post.id)
     return post
 
 
@@ -804,6 +810,52 @@ async def stats(db: Session = Depends(get_db)) -> StatsOut:
         processed_events=processed_events,
     )
 
+
+@app.get("/events/export", response_model=List[ClubEventsExport])
+async def export_events(db: Session = Depends(get_db)) -> List[ClubEventsExport]:
+    extracted_events = (
+        db.query(ExtractedEvent)
+        .join(Post)
+        .join(Club)
+        .options(joinedload(ExtractedEvent.post).joinedload(Post.club))
+        .order_by(Club.name.asc(), ExtractedEvent.created_at.desc())
+        .all()
+    )
+
+    clubs: Dict[int, ClubEventsExport] = {}
+    for extracted in extracted_events:
+        post = extracted.post
+        club = post.club
+        if club.id not in clubs:
+            clubs[club.id] = ClubEventsExport(
+                club_id=club.id,
+                club_name=club.name,
+                club_username=club.username,
+                club_profile_url=f"https://www.instagram.com/{club.username}/",
+                events=[],
+            )
+        wrapper = clubs[club.id]
+        post_url = f"https://www.instagram.com/p/{post.instagram_id}/"
+        image_url = None
+        if post.local_image_path:
+            image_url = get_image_url(post.local_image_path)
+        elif post.image_url:
+            image_url = post.image_url
+        event_item = EventExportItem(
+            db_id=f"event:{extracted.id}",
+            post_id=post.id,
+            post_instagram_id=post.instagram_id,
+            post_url=post_url,
+            post_timestamp=post.post_timestamp.isoformat() if isinstance(post.post_timestamp, datetime) else str(post.post_timestamp),
+            post_caption=post.caption,
+            post_image_url=image_url,
+            payload=extracted.event_data_json,
+            extraction_confidence=extracted.extraction_confidence,
+        )
+        wrapper.events.append(event_item)
+
+    return list(clubs.values())
+
 def _render_status(settings) -> MonitorStatus:
     last_run = monitor_service.last_run.isoformat() if monitor_service.last_run else None
     rate_limit_until = monitor_service.rate_limit_until
@@ -857,3 +909,27 @@ def _system_settings_out(settings) -> SystemSettingsOut:
         created_at=_iso(settings.created_at),
         updated_at=_iso(settings.updated_at),
     )
+
+
+def _run_gemini_auto_extract(post_id: int) -> None:
+    session = SessionLocal()
+    try:
+        post = (
+            session.query(Post)
+            .options(joinedload(Post.extracted_event))
+            .filter(Post.id == post_id)
+            .one_or_none()
+        )
+        if not post:
+            return
+        settings = ensure_default_settings(session)
+        changed = auto_extract_for_post(post, settings, overwrite=False)
+        if changed:
+            session.commit()
+        else:
+            session.rollback()
+    except Exception as exc:  # pragma: no cover - background safety
+        session.rollback()
+        print(f"Gemini background extraction failed for post {post_id}: {exc}")
+    finally:
+        session.close()

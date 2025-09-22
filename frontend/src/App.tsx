@@ -218,6 +218,7 @@ const App = () => {
   const [deletingPostId, setDeletingPostId] = useState<number | null>(null);
   const [isImportingApifyRun, setIsImportingApifyRun] = useState(false);
   const [lastLoadedRunId, setLastLoadedRunId] = useState<string | null>(null);
+  const [isExportingEvents, setIsExportingEvents] = useState(false);
 
   // Helper function to get the appropriate image URL
   const getImageUrl = (post: PostRecord): string | null => {
@@ -234,7 +235,15 @@ const App = () => {
   );
   const reviewQueue = useMemo(() => {
     return posts
-      .filter((post) => post.is_event_poster === null || post.is_event_poster === true)
+      .filter((post) => {
+        if (post.is_event_poster === null) {
+          return true;
+        }
+        if (post.is_event_poster === true) {
+          return !post.extracted_event;
+        }
+        return false;
+      })
       .map((post) => ({
         post,
         source: post.is_event_poster === true ? "ai" : "manual",
@@ -677,6 +686,34 @@ const App = () => {
     }
   };
 
+  const handleExportEvents = async () => {
+    try {
+      setIsExportingEvents(true);
+      const response = await fetch(`${API_BASE}/events/export`);
+      if (!response.ok) {
+        const text = await response.text();
+        throw new Error(text || "Failed to export events");
+      }
+      const data = await response.json();
+      const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+      const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+      const filename = `event-export-${timestamp}.json`;
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = filename;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      URL.revokeObjectURL(url);
+      showSuccess("Downloaded event export JSON.");
+    } catch (err) {
+      handleApiError((err as Error).message);
+    } finally {
+      setIsExportingEvents(false);
+    }
+  };
+
   const handleClearApifyToken = async () => {
     try {
       setIsClearingApifyToken(true);
@@ -1013,7 +1050,14 @@ const App = () => {
         throw new Error("Failed to classify post");
       }
       await refreshAll();
-      showSuccess(`Marked post ${post.instagram_id} as ${isEvent ? "event" : "non-event"}`);
+      if (isEvent && systemSettings?.gemini_auto_extract && systemSettings?.has_gemini_api_key) {
+        showSuccess(`Marked post ${post.instagram_id} as event; Gemini extraction is running.`);
+        setTimeout(() => {
+          refreshAll().catch(() => undefined);
+        }, 4000);
+      } else {
+        showSuccess(`Marked post ${post.instagram_id} as ${isEvent ? "event" : "non-event"}`);
+      }
     } catch (err) {
       handleApiError((err as Error).message);
     }
@@ -2176,7 +2220,17 @@ const App = () => {
                 <FileText className="h-5 w-5 text-purple-600" />
                 Ready for Extraction
               </h2>
-              <span className="text-sm text-gray-500">{eventPosts.length} posts marked as events</span>
+              <div className="flex items-center gap-3">
+                <span className="text-sm text-gray-500">{eventPosts.length} posts marked as events</span>
+                <button
+                  onClick={handleExportEvents}
+                  disabled={isExportingEvents || eventPosts.length === 0}
+                  className="flex items-center gap-2 px-3 py-1.5 rounded-md border border-purple-200 text-sm font-medium text-purple-600 hover:bg-purple-50 disabled:opacity-50"
+                >
+                  <Download className={`h-4 w-4 ${isExportingEvents ? "animate-spin" : ""}`} />
+                  {isExportingEvents ? "Exporting..." : "Export events"}
+                </button>
+              </div>
             </div>
             <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-6">
               {eventPosts.map((post) => (

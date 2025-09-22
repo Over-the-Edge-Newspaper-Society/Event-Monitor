@@ -76,6 +76,7 @@ If the runner or Node is missing, the backend transparently falls back to the ex
 - `POST /posts/{id}/classify` – manual override.
 - `POST /posts/{id}/extract` – invoke Gemini to parse the poster image (requires API key).
 - `POST /posts/{id}/events` – persist manual edits or reviewed Gemini JSON and mark processed.
+- `GET /events/export` – download all extracted events grouped by club with Instagram metadata wrappers.
 - `GET /stats` – quick dashboard metrics.
 
 The monitoring loop respects the `monitoring_enabled` flag (default `false`). Auto-classification uses the keyword classifier; drop a `event_classifier.pkl` beside `backend/app/services/classifier.py` to use a custom scikit-learn model instead.
@@ -86,6 +87,12 @@ The monitoring loop respects the `monitoring_enabled` flag (default `false`). Au
 - The Events tab exposes an “Extract with Gemini” button that calls `POST /posts/{id}/extract` and automatically stores the structured JSON payload under the matching post.
 - You can re-run extraction at any time; existing JSON is overwritten unless `overwrite=false` is supplied on the endpoint.
 - Enable the “auto extract” toggle on the Gemini card to process newly detected/approved event posts automatically (falls back to manual review if the call fails).
+- Gemini submits both the poster image and the Instagram caption (when available) to the prompt for richer context.
+
+### Exporting Extracted Events
+- Use `GET /events/export` (or the dashboard export button) to download all stored events.
+- Each club is returned once with `clubName`, profile URL, and an `events` array containing the original extractor payload plus metadata like Instagram post URL, caption, and a stable DB identifier.
+- Ideal for feeding downstream pipelines without touching the original prompt results; your workflow can merge the wrapper metadata with other systems on import.
 
 ## Frontend Setup
 1. Install dependencies and start the Vite dev server:
