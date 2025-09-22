@@ -179,6 +179,7 @@ class SystemSettingsOut(BaseModel):
     apify_actor_id: Optional[str]
     apify_results_limit: int
     has_apify_token: bool
+    has_gemini_api_key: bool
     instagram_fetcher: str = Field(pattern="^(auto|instaloader|apify)$")
     created_at: str
     updated_at: str
@@ -217,6 +218,10 @@ class SystemSettingsUpdate(BaseModel):
 
 class ApifyTokenUpdate(BaseModel):
     token: Optional[str] = None
+
+
+class GeminiApiKeyUpdate(BaseModel):
+    api_key: str = Field(min_length=1)
 
 
 class ApifyTestRequest(BaseModel):

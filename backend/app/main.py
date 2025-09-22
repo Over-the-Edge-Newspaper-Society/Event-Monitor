@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import os
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Set
@@ -39,6 +40,13 @@ from .schemas import (
     ClubFetchLatestResponse,
     DeletePostResponse,
     ApifyImportStats,
+    GeminiApiKeyUpdate,
+)
+from .services.gemini_extractor import (
+    GeminiApiKeyMissing,
+    GeminiClientUnavailable,
+    GeminiExtractionError,
+    extract_event_data_for_post,
 )
 from .services.monitor import monitor_service, RateLimitError, ApifyIntegrationError
 from .utils.apify_client import ApifyRunTimeoutError
@@ -193,6 +201,27 @@ async def clear_apify_token(db: Session = Depends(get_db)) -> SystemSettingsOut:
     db.commit()
     db.refresh(settings)
     monitor_service.clear_last_error()
+    return _system_settings_out(settings)
+
+
+@app.post("/settings/gemini/api-key", response_model=SystemSettingsOut)
+async def update_gemini_api_key(
+    payload: GeminiApiKeyUpdate,
+    db: Session = Depends(get_db),
+) -> SystemSettingsOut:
+    settings = ensure_default_settings(db)
+    settings.gemini_api_key = payload.api_key.strip()
+    db.commit()
+    db.refresh(settings)
+    return _system_settings_out(settings)
+
+
+@app.delete("/settings/gemini/api-key", response_model=SystemSettingsOut)
+async def clear_gemini_api_key(db: Session = Depends(get_db)) -> SystemSettingsOut:
+    settings = ensure_default_settings(db)
+    settings.gemini_api_key = None
+    db.commit()
+    db.refresh(settings)
     return _system_settings_out(settings)
 
 
@@ -674,6 +703,71 @@ async def attach_event(
     return post
 
 
+@app.post("/posts/{post_id}/extract", response_model=PostOut)
+async def extract_event_with_gemini(
+    post_id: int,
+    overwrite: bool = True,
+    db: Session = Depends(get_db),
+) -> PostOut:
+    post = (
+        db.query(Post)
+        .options(joinedload(Post.club), joinedload(Post.extracted_event))
+        .filter(Post.id == post_id)
+        .one_or_none()
+    )
+    if not post:
+        raise HTTPException(status_code=404, detail="Post not found")
+
+    if post.is_event_poster is False:
+        raise HTTPException(status_code=400, detail="Post is not classified as an event poster")
+
+    if post.extracted_event and not overwrite:
+        raise HTTPException(status_code=409, detail="Event data already exists for this post")
+
+    settings = ensure_default_settings(db)
+    api_key = (settings.gemini_api_key or "").strip() or os.getenv("GEMINI_API_KEY", "").strip()
+    if not api_key:
+        raise HTTPException(status_code=400, detail="Gemini API key is not configured")
+
+    try:
+        payload, downloaded_filename = extract_event_data_for_post(post, api_key)
+    except GeminiApiKeyMissing as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except GeminiClientUnavailable as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    except GeminiExtractionError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    if downloaded_filename and downloaded_filename != post.local_image_path:
+        post.local_image_path = downloaded_filename
+
+    extraction_confidence = None
+    payload_confidence = None
+    if isinstance(payload, dict):
+        payload_confidence = payload.get("extractionConfidence")
+    if isinstance(payload_confidence, dict):
+        overall = payload_confidence.get("overall")
+        try:
+            extraction_confidence = float(overall) if overall is not None else None
+        except (TypeError, ValueError):
+            extraction_confidence = None
+
+    if post.extracted_event:
+        post.extracted_event.event_data_json = payload
+        post.extracted_event.extraction_confidence = extraction_confidence
+    else:
+        post.extracted_event = ExtractedEvent(
+            post_id=post.id,
+            event_data_json=payload,
+            extraction_confidence=extraction_confidence,
+        )
+
+    post.processed = True
+    db.commit()
+    db.refresh(post)
+    return post
+
+
 @app.delete("/posts/{post_id}", response_model=DeletePostResponse)
 async def delete_post(post_id: int, db: Session = Depends(get_db)) -> DeletePostResponse:
     post = db.query(Post).filter(Post.id == post_id).one_or_none()
@@ -746,6 +840,7 @@ def _system_settings_out(settings) -> SystemSettingsOut:
         apify_actor_id=settings.apify_actor_id,
         apify_results_limit=settings.apify_results_limit,
         has_apify_token=bool(getattr(settings, "apify_api_token", None)),
+        has_gemini_api_key=bool((settings.gemini_api_key or "").strip() or os.getenv("GEMINI_API_KEY")),
         instagram_fetcher=(settings.instagram_fetcher or "auto"),
         created_at=_iso(settings.created_at),
         updated_at=_iso(settings.updated_at),

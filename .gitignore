@@ -6,3 +6,8 @@ backend/app/static/images
 
 # macOS
 .DS_Store
+backend/app/services/__pycache__/monitor.cpython-312.pyc
+backend/app/utils/__pycache__/apify_client.cpython-312.pyc
+backend/app/services/__pycache__/monitor.cpython-312.pyc
+backend/app/__pycache__/models.cpython-312.pyc
+backend/app/__pycache__/main.cpython-312.pyc

@@ -14,6 +14,7 @@ import {
   Upload,
   Zap,
   Trash2,
+  Sparkles,
 } from "lucide-react";
 
 const RAW_API_BASE = import.meta.env.VITE_API_BASE ?? "http://localhost:8000";
@@ -94,6 +95,7 @@ interface SystemSettings {
   apify_actor_id?: string | null;
   apify_results_limit: number;
   has_apify_token: boolean;
+  has_gemini_api_key: boolean;
   instagram_fetcher: FetcherMode;
   created_at: string;
   updated_at: string;
@@ -180,6 +182,8 @@ const App = () => {
   const [eventModalPost, setEventModalPost] = useState<PostRecord | null>(null);
   const [eventJson, setEventJson] = useState<string>("");
   const [eventJsonError, setEventJsonError] = useState<string | null>(null);
+  const [isExtractingEvent, setIsExtractingEvent] = useState(false);
+  const [extractEventError, setExtractEventError] = useState<string | null>(null);
   const [isUpdatingWorkflow, setIsUpdatingWorkflow] = useState(false);
   const [sessionUsernameInput, setSessionUsernameInput] = useState("");
   const [isUploadingSession, setIsUploadingSession] = useState(false);
@@ -194,6 +198,9 @@ const App = () => {
   const [isSavingApifySettings, setIsSavingApifySettings] = useState(false);
   const [isSavingApifyToken, setIsSavingApifyToken] = useState(false);
   const [isClearingApifyToken, setIsClearingApifyToken] = useState(false);
+  const [geminiApiKeyInput, setGeminiApiKeyInput] = useState("");
+  const [isSavingGeminiKey, setIsSavingGeminiKey] = useState(false);
+  const [isClearingGeminiKey, setIsClearingGeminiKey] = useState(false);
   const [apifyFetcherMode, setApifyFetcherMode] = useState<FetcherMode>("auto");
   const [apifyTestUrl, setApifyTestUrl] = useState("https://www.instagram.com/humansofny/");
   const [apifyTestLimit, setApifyTestLimit] = useState<number>(1);
@@ -594,6 +601,53 @@ const App = () => {
     }
   };
 
+  const handleSaveGeminiKey = async () => {
+    const trimmed = geminiApiKeyInput.trim();
+    if (!trimmed) {
+      handleApiError("Paste a Gemini API key before saving.");
+      return;
+    }
+    try {
+      setIsSavingGeminiKey(true);
+      const response = await fetch(`${API_BASE}/settings/gemini/api-key`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ api_key: trimmed }),
+      });
+      if (!response.ok) {
+        const text = await response.text();
+        throw new Error(text || "Failed to store Gemini API key");
+      }
+      setGeminiApiKeyInput("");
+      await fetchSystemSettings();
+      showSuccess("Saved Gemini API key.");
+    } catch (err) {
+      handleApiError((err as Error).message);
+    } finally {
+      setIsSavingGeminiKey(false);
+    }
+  };
+
+  const handleClearGeminiKey = async () => {
+    try {
+      setIsClearingGeminiKey(true);
+      const response = await fetch(`${API_BASE}/settings/gemini/api-key`, {
+        method: "DELETE",
+      });
+      if (!response.ok) {
+        const text = await response.text();
+        throw new Error(text || "Failed to remove Gemini API key");
+      }
+      setGeminiApiKeyInput("");
+      await fetchSystemSettings();
+      showSuccess("Removed Gemini API key.");
+    } catch (err) {
+      handleApiError((err as Error).message);
+    } finally {
+      setIsClearingGeminiKey(false);
+    }
+  };
+
   const handleClearApifyToken = async () => {
     try {
       setIsClearingApifyToken(true);
@@ -940,12 +994,16 @@ const App = () => {
     setEventModalPost(post);
     setEventJson(post.extracted_event ? JSON.stringify(post.extracted_event.event_data_json, null, 2) : "");
     setEventJsonError(null);
+    setExtractEventError(null);
+    setIsExtractingEvent(false);
   };
 
   const closeEventModal = () => {
     setEventModalPost(null);
     setEventJson("");
     setEventJsonError(null);
+    setExtractEventError(null);
+    setIsExtractingEvent(false);
   };
 
   const handleSaveEventJson = async () => {
@@ -975,6 +1033,39 @@ const App = () => {
       closeEventModal();
     } catch (err) {
       handleApiError((err as Error).message);
+    }
+  };
+
+  const handleExtractEvent = async () => {
+    if (!eventModalPost) return;
+    if (!systemSettings?.has_gemini_api_key) {
+      setExtractEventError("Add a Gemini API key in Setup to enable automatic extraction.");
+      return;
+    }
+    try {
+      setIsExtractingEvent(true);
+      setExtractEventError(null);
+      setEventJsonError(null);
+      const response = await fetch(`${API_BASE}/posts/${eventModalPost.id}/extract`, {
+        method: "POST",
+      });
+      if (!response.ok) {
+        const text = await response.text();
+        throw new Error(text || "Failed to extract event data");
+      }
+      const updatedPost: PostRecord = await response.json();
+      setEventModalPost(updatedPost);
+      if (updatedPost.extracted_event) {
+        setEventJson(JSON.stringify(updatedPost.extracted_event.event_data_json, null, 2));
+      }
+      await Promise.all([fetchPosts(), fetchStats()]);
+      showSuccess("Gemini extracted event data.");
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Failed to extract event data";
+      setExtractEventError(message);
+      handleApiError(message);
+    } finally {
+      setIsExtractingEvent(false);
     }
   };
 
@@ -1150,6 +1241,55 @@ const App = () => {
                 {clubs.length === 0 && (
                   <p className="text-sm text-gray-500">Upload a CSV to start tracking clubs.</p>
                 )}
+              </div>
+            </section>
+
+            <section className="bg-white rounded-xl shadow-sm p-6 space-y-4">
+              <div className="flex items-center justify-between">
+                <h2 className="text-xl font-semibold flex items-center gap-2">
+                  <Sparkles className="h-5 w-5 text-purple-600" />
+                  Gemini Event Extraction
+                </h2>
+                <span className="text-xs text-gray-500">
+                  {systemSettings?.has_gemini_api_key ? "Ready" : "Not configured"}
+                </span>
+              </div>
+              <p className="text-sm text-gray-600">
+                Store a Gemini API key to let the app read posters and draft structured event JSON with one click.
+              </p>
+              <div className="space-y-3">
+                <label className="block text-sm font-medium text-gray-700">Gemini API key</label>
+                <input
+                  type="password"
+                  value={geminiApiKeyInput}
+                  onChange={(event) => setGeminiApiKeyInput(event.target.value)}
+                  placeholder="AI... (from Google AI Studio)"
+                  className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:border-purple-500 focus:outline-none focus:ring-2 focus:ring-purple-200"
+                />
+                <div className="flex flex-wrap items-center gap-3">
+                  <button
+                    onClick={handleSaveGeminiKey}
+                    disabled={isSavingGeminiKey}
+                    className="px-4 py-2 rounded-lg bg-purple-600 hover:bg-purple-700 text-white text-sm font-medium disabled:bg-purple-400"
+                  >
+                    {isSavingGeminiKey ? "Saving..." : "Save key"}
+                  </button>
+                  <button
+                    onClick={handleClearGeminiKey}
+                    disabled={!systemSettings?.has_gemini_api_key || isClearingGeminiKey}
+                    className="px-4 py-2 rounded-lg border border-red-200 text-sm font-medium text-red-600 hover:bg-red-50 disabled:border-gray-200 disabled:text-gray-400"
+                  >
+                    {isClearingGeminiKey ? "Removing..." : "Remove key"}
+                  </button>
+                  <span className="text-xs text-gray-500">
+                    {systemSettings?.has_gemini_api_key
+                      ? "Key stored locally for extraction."
+                      : "Generate one in Google AI Studio → API Keys."}
+                  </span>
+                </div>
+                <p className="text-xs text-gray-500">
+                  The key lives only in your local settings database; nothing is uploaded elsewhere.
+                </p>
               </div>
             </section>
 
@@ -2065,6 +2205,31 @@ const App = () => {
                 </button>
               </div>
               <div className="px-6 py-4 space-y-4">
+                <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+                  <p className="text-sm text-gray-600">
+                    {systemSettings?.has_gemini_api_key
+                      ? "Let Gemini read the poster and pre-fill the JSON template."
+                      : "Add your Gemini API key on the Setup tab to enable automated extraction."}
+                  </p>
+                  <button
+                    onClick={handleExtractEvent}
+                    disabled={isExtractingEvent || !systemSettings?.has_gemini_api_key}
+                    className="flex items-center justify-center gap-2 px-4 py-2 rounded-md bg-purple-600 hover:bg-purple-700 text-white text-sm font-medium disabled:bg-purple-300"
+                  >
+                    {isExtractingEvent ? (
+                      <>
+                        <RefreshCcw className="h-4 w-4 animate-spin" />
+                        Extracting...
+                      </>
+                    ) : (
+                      <>
+                        <Sparkles className="h-4 w-4" />
+                        Extract with Gemini
+                      </>
+                    )}
+                  </button>
+                </div>
+                {extractEventError && <p className="text-sm text-red-600">{extractEventError}</p>}
                 <textarea
                   className="w-full h-64 border border-gray-300 rounded-lg p-3 font-mono text-sm"
                   placeholder="Paste extracted event JSON here"

@@ -9,6 +9,7 @@ End-to-end prototype for continuously scraping Instagram club accounts, classify
 - **Background monitoring loop** that polls active clubs on a schedule.
 - **REST API** (FastAPI) for monitor control, classification queue, and event storage.
 - **React dashboard** (Vite + Tailwind) mirroring the architecture mock-ups for CSV import, monitoring controls, manual review, and event JSON management.
+- **Gemini-powered extraction** that turns approved posters into structured event JSON with a single click once an API key is configured.
 
 ## Repository Layout
 ```
@@ -73,10 +74,17 @@ If the runner or Node is missing, the backend transparently falls back to the ex
 - `POST /clubs/import` – upload CSV via UI.
 - `GET /posts?status=pending|events|non_events` – queue management.
 - `POST /posts/{id}/classify` – manual override.
-- `POST /posts/{id}/events` – store Claude extraction JSON and mark processed.
+- `POST /posts/{id}/extract` – invoke Gemini to parse the poster image (requires API key).
+- `POST /posts/{id}/events` – persist manual edits or reviewed Gemini JSON and mark processed.
 - `GET /stats` – quick dashboard metrics.
 
 The monitoring loop respects the `monitoring_enabled` flag (default `false`). Auto-classification uses the keyword classifier; drop a `event_classifier.pkl` beside `backend/app/services/classifier.py` to use a custom scikit-learn model instead.
+
+### Gemini Event Extraction
+- Provide a Gemini API key through the dashboard (Setup → Gemini card) or set the `GEMINI_API_KEY` environment variable before starting the backend. A stored key is never exposed via the API responses—only its presence is reported.
+- Optionally override the model with `GEMINI_MODEL_ID` (defaults to `gemini-2.5-flash`).
+- The Events tab exposes an “Extract with Gemini” button that calls `POST /posts/{id}/extract` and automatically stores the structured JSON payload under the matching post.
+- You can re-run extraction at any time; existing JSON is overwritten unless `overwrite=false` is supplied on the endpoint.
 
 ## Frontend Setup
 1. Install dependencies and start the Vite dev server:
