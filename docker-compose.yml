@@ -7,9 +7,9 @@ services:
     ports:
       - "8000:8000"
     volumes:
-      - ./backend/instagram_monitor.db:/app/instagram_monitor.db
-      - ./backend/app/static/images:/app/app/static/images
-      - ./backend/instaloader_session:/app/app/instaloader_session
+      - event-monitor-db:/app/instagram_monitor.db
+      - event-monitor-images:/app/app/static/images
+      - event-monitor-session:/app/app/instaloader_session
     environment:
       - PYTHONPATH=/app
     restart: unless-stopped
@@ -26,3 +26,8 @@ services:
     ports:
       - "3000:80"
     restart: unless-stopped
+
+volumes:
+  event-monitor-db:
+  event-monitor-images:
+  event-monitor-session:

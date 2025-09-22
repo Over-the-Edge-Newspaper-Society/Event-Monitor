@@ -114,14 +114,20 @@ Spin up the React dashboard and FastAPI backend together with Docker Compose (ha
 
 1. Build and start both services:
    ```bash
-   docker-compose up --build
+   docker compose up --build
    ```
-   The frontend is served on `http://localhost:3000` and proxies API calls to the backend container.
+   The frontend is served on `http://localhost:3000` and proxies API calls to the backend container. Expose the same ports (or adjust them) on Komodo or any other remote host so teammates can reach the dashboard from their machines.
 2. Access the API directly at `http://localhost:8000` if needed, or via the frontend's `/api/*` proxy.
-3. Local volumes keep state between restarts:
-   - `backend/instagram_monitor.db` (SQLite database)
-   - `backend/app/static/images` (downloaded Instagram images)
-4. To deploy on a remote host, copy the repository, adjust exposed ports in `docker-compose.yml` as required, then run `docker-compose up -d --build`.
+3. Named Docker volumes keep state between restarts and deployments:
+   - `event-monitor-db` → `/app/instagram_monitor.db` (SQLite database)
+   - `event-monitor-images` → `/app/app/static/images` (downloaded Instagram images)
+   - `event-monitor-session` → `/app/app/instaloader_session` (Instagram session cookies)
+   On a fresh host, Docker creates these volumes automatically; snapshot or migrate them as needed for backups.
+4. To deploy on a remote machine (e.g., Komodo), copy this repository, set any required environment variables, and run:
+   ```bash
+   docker compose up -d --build
+   ```
+   Open firewall ports `3000` (dashboard) and optionally `8000` (direct API) so other computers on your network can connect. If the dashboard sits behind a reverse proxy, set the `VITE_API_BASE` build arg in `docker-compose.yml` to the public `/api` path the proxy exposes.
 
 ### Instagram Login & Rate Limits
 - Generate a session file on your desktop: `instaloader -l YOUR_USERNAME` (the command will create `YOUR_USERNAME.session` once you authenticate and complete 2FA).
