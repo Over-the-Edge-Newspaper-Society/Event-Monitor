@@ -2,6 +2,7 @@
 node_modules/
 .venv/
 backend/instaloader_session/
+backend/app/static/images
 
 # macOS
 .DS_Store

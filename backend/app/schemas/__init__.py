@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field, validator
 
@@ -140,6 +140,7 @@ class MonitorStatus(BaseModel):
     last_error: Optional[str] = None
     apify_enabled: bool
     instagram_fetcher: str = Field(pattern="^(auto|instaloader|apify)$")
+    apify_runner: str = Field(pattern="^(disabled|unconfigured|rest|rest_fallback|node)$")
     session_username: Optional[str] = None
     session_uploaded_at: Optional[str] = None
     session_age_minutes: Optional[int] = None
@@ -216,3 +217,53 @@ class SystemSettingsUpdate(BaseModel):
 
 class ApifyTokenUpdate(BaseModel):
     token: Optional[str] = None
+
+
+class ApifyTestRequest(BaseModel):
+    url: str = Field(min_length=1)
+    limit: Optional[int] = Field(default=10, ge=1, le=100)
+
+
+class ApifyTestPostOut(BaseModel):
+    id: str
+    username: Optional[str] = None
+    caption: Optional[str] = None
+    image_url: Optional[str] = None
+    timestamp: Optional[str] = None
+    is_video: bool = False
+    permalink: Optional[str] = None
+
+    @validator("timestamp", pre=True)
+    def format_timestamp(cls, v):
+        if isinstance(v, datetime):
+            return v.isoformat()
+        return v
+
+
+class ApifyTestResponse(BaseModel):
+    runner: str = Field(pattern="^(rest|rest_fallback|node)$")
+    input: Dict[str, Any]
+    items: List[Dict[str, Any]]
+    posts: List[ApifyTestPostOut]
+
+
+class DeletePostResponse(BaseModel):
+    id: int
+    success: bool = True
+
+
+class ApifyImportStats(BaseModel):
+    attempted: int
+    created: int
+    skipped_existing: int
+    missing_clubs: int
+    message: str
+
+
+class ClubFetchLatestResponse(BaseModel):
+    club_id: int
+    club_username: str
+    requested: int
+    fetched: int
+    created: int
+    message: str

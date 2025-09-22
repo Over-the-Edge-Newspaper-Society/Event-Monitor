@@ -7,24 +7,26 @@ import random
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional, Set
+from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 from sqlalchemy.orm import Session
 
-from ..models import Club, Post, ClassificationModeEnum, ensure_default_settings
+from ..models import (
+    Club,
+    Post,
+    ClassificationModeEnum,
+    ensure_default_settings,
+    DEFAULT_APIFY_ACTOR_ID as MODEL_DEFAULT_APIFY_ACTOR_ID,
+)
 from .classifier import CaptionClassifier
 from ..utils.image_downloader import download_image
 from ..utils.apify_client import ApifyClient, ApifyClientError, ApifyRunTimeoutError
 
 APIFY_DEFAULT_INPUT = {
-    "addParentData": False,
-    "enhanceUserSearchWithFacebookPage": False,
-    "isUserReelFeedURL": False,
-    "isUserTaggedFeedURL": False,
-    "searchType": "hashtag",
-    "searchLimit": 1,
+    "skipPinnedPosts": False,
 }
 APIFY_BATCH_SIZE = int(os.getenv("APIFY_BATCH_SIZE", "8"))
+DEFAULT_APIFY_ACTOR_ID = os.getenv("APIFY_ACTOR_ID", MODEL_DEFAULT_APIFY_ACTOR_ID)
 
 try:
     from instaloader import Instaloader, Profile
@@ -204,7 +206,8 @@ class MonitorService:
                 club.username: self._get_recent_post_ids(session, club.id)
                 for club in clubs
             }
-            limit = settings.apify_results_limit or post_count
+            configured_limit = settings.apify_results_limit or post_count
+            limit = max(1, min(configured_limit, post_count))
             apify_bulk_cache = self._collect_posts_via_apify_bulk(
                 apify_client,
                 usernames,
@@ -242,6 +245,50 @@ class MonitorService:
         except ApifyIntegrationError:
             session.rollback()
             raise
+
+    def fetch_latest_posts_for_club(
+        self,
+        session: Session,
+        club: Club,
+        post_count: int,
+        settings,
+    ) -> Dict[str, Any]:
+        desired = int(post_count) if post_count else 1
+        configured_limit = settings.apify_results_limit or desired
+        requested = max(1, min(desired, configured_limit))
+        known_post_ids = self._get_recent_post_ids(session, club.id)
+        global_auto = (settings.classification_mode or ClassificationModeEnum.MANUAL).lower() == ClassificationModeEnum.AUTO
+        auto_classify = global_auto and (club.classification_mode or ClassificationModeEnum.MANUAL).lower() == ClassificationModeEnum.AUTO
+
+        posts: List[Dict] = self._fetch_latest_posts_for_club(
+            settings,
+            club.username,
+            requested,
+            known_post_ids,
+        )
+
+        created = 0
+        for post in posts:
+            if self._create_post_if_new(session, club, post, auto_classify):
+                created += 1
+
+        club.last_checked = datetime.utcnow()
+        session.commit()
+        self.clear_last_error()
+
+        if created > 0:
+            message = f"Fetched {created} new post(s) for @{club.username}."
+        elif posts:
+            message = f"No new posts for @{club.username}; latest {len(posts)} already stored."
+        else:
+            message = f"No posts returned for @{club.username}."
+
+        return {
+            "requested": requested,
+            "fetched": len(posts),
+            "created": created,
+            "message": message,
+        }
 
     def _collect_latest_posts(
         self,
@@ -539,17 +586,45 @@ class MonitorService:
             return False
         return bool(self.loader)
 
+    def get_apify_runner_status(self, settings) -> str:
+        mode = self._get_fetch_mode(settings)
+        apify_enabled = bool(getattr(settings, "apify_enabled", False))
+        ready = self._apify_ready(settings)
+
+        if mode == "apify":
+            if not ready:
+                return "unconfigured"
+        elif mode == "auto":
+            if not apify_enabled:
+                return "disabled"
+            if not ready:
+                return "unconfigured"
+        else:
+            return "disabled"
+
+        client = self._get_apify_client(settings)
+        if not client:
+            return "unconfigured"
+
+        info = client.runtime_info()
+        if info.get("using_node"):
+            return "node"
+        if info.get("node_failed") or (info.get("prefer_node") and not info.get("node_available")):
+            return "rest_fallback"
+        return "rest"
+
     def _get_apify_client(self, settings) -> Optional[ApifyClient]:
         if not self._should_use_apify(settings):
             return None
-        signature = f"{settings.apify_api_token}:{settings.apify_actor_id}"
+        actor_id = getattr(settings, "apify_actor_id", None) or DEFAULT_APIFY_ACTOR_ID
+        signature = f"{settings.apify_api_token}:{actor_id}"
         if self._apify_client and self._apify_signature == signature:
             return self._apify_client
         if self._apify_client:
             self._apify_client.close()
             self._apify_client = None
         try:
-            self._apify_client = ApifyClient(settings.apify_api_token, settings.apify_actor_id)
+            self._apify_client = ApifyClient(settings.apify_api_token, actor_id)
         except ValueError as exc:
             self.set_last_error(str(exc))
             self._apify_client = None
@@ -564,21 +639,11 @@ class MonitorService:
         limit: int,
         known_post_ids: Optional[Set[str]] = None,
     ) -> List[Dict]:
-        run_input = {
-            **APIFY_DEFAULT_INPUT,
-            "directUrls": [f"https://www.instagram.com/{username}/"],
-            "resultsType": "posts",
-            "resultsLimit": max(limit, 1),
-            "maxItems": max(limit, 1),
-        }
-        try:
-            items = client.run_and_collect(
-                run_input,
-                dataset_limit=limit,
-                timeout_seconds=self._apify_timeout_seconds,
-            )
-        except (ApifyClientError, ApifyRunTimeoutError) as exc:
-            raise ApifyIntegrationError(str(exc)) from exc
+        _, items = self._run_apify_actor(
+            client,
+            [f"https://www.instagram.com/{username.strip().lstrip('@').rstrip('/')}/"],
+            limit,
+        )
 
         posts: List[Dict] = []
         consecutive_known = 0
@@ -618,6 +683,330 @@ class MonitorService:
             )
         return posts
 
+    def _run_apify_actor(
+        self,
+        client: ApifyClient,
+        direct_urls: List[str],
+        limit: int,
+    ) -> tuple[Dict[str, Any], List[Dict[str, Any]]]:
+        if not direct_urls:
+            raise ApifyIntegrationError("Apify run requires at least one Instagram identifier")
+
+        username_inputs: List[str] = []
+        profile_urls: List[str] = []
+        for value in direct_urls:
+            if not value:
+                continue
+            cleaned = value.strip()
+            if not cleaned:
+                continue
+            if cleaned.startswith("http"):
+                normalized_url = cleaned.rstrip("/") + "/"
+                profile_urls.append(normalized_url)
+                username_inputs.append(normalized_url)
+            else:
+                normalized_username = cleaned.lstrip("@").strip("/")
+                if not normalized_username:
+                    continue
+                username_inputs.append(normalized_username)
+                profile_urls.append(f"https://www.instagram.com/{normalized_username}/")
+
+        if not username_inputs:
+            raise ApifyIntegrationError("Apify run requires valid Instagram usernames or URLs")
+
+        limit_value = max(limit, 1)
+        run_input: Dict[str, Any] = {
+            **APIFY_DEFAULT_INPUT,
+            "username": username_inputs,
+            "resultsLimit": limit_value,
+        }
+        if profile_urls:
+            run_input["directUrls"] = profile_urls
+        run_input["maxItems"] = limit_value
+        try:
+            items = client.run_and_collect(
+                run_input,
+                dataset_limit=limit_value,
+                timeout_seconds=self._apify_timeout_seconds,
+            )
+        except (ApifyClientError, ApifyRunTimeoutError) as exc:
+            raise ApifyIntegrationError(str(exc)) from exc
+        return run_input, items
+
+    def test_apify_fetch(
+        self,
+        settings,
+        url: str,
+        limit: int = 10,
+    ) -> Dict[str, Any]:
+        if not url:
+            raise ApifyIntegrationError("Instagram URL is required")
+        apify_client = self._get_apify_client(settings)
+        if not apify_client:
+            raise ApifyIntegrationError("Apify integration is not configured.")
+
+        run_input, raw_items = self._run_apify_actor(apify_client, [url], limit)
+        username_values = run_input.get("username")
+        username = None
+        if isinstance(username_values, list) and username_values:
+            first = username_values[0]
+            if isinstance(first, str):
+                username = first.lstrip("@").strip("/") or None
+        if not username:
+            direct_urls = run_input.get("directUrls")
+            if isinstance(direct_urls, list) and direct_urls:
+                first_url = direct_urls[0]
+                if isinstance(first_url, str):
+                    username = self._extract_username_from_item({"inputUrl": first_url})
+        normalized_posts: List[Dict[str, Any]] = []
+        if username:
+            normalized_posts = self._convert_items_to_posts(raw_items, username, limit)
+        runner_info = apify_client.runtime_info()
+        if runner_info.get("using_node"):
+            runner_mode = "node"
+        elif runner_info.get("node_failed") or (runner_info.get("prefer_node") and not runner_info.get("node_available")):
+            runner_mode = "rest_fallback"
+        else:
+            runner_mode = runner_info.get("last_runner") or "rest"
+
+        return {
+            "input": run_input,
+            "items": raw_items,
+            "posts": normalized_posts,
+            "runner": runner_mode,
+        }
+
+    def fetch_apify_run_snapshot(
+        self,
+        settings,
+        run_id: str,
+        limit: int = 10,
+    ) -> Dict[str, Any]:
+        if not run_id:
+            raise ApifyIntegrationError("Apify run ID is required")
+        apify_client = self._get_apify_client(settings)
+        if not apify_client:
+            raise ApifyIntegrationError("Apify integration is not configured.")
+
+        configured_limit = settings.apify_results_limit or limit or 10
+        effective_limit = max(1, min(limit or configured_limit, configured_limit))
+
+        try:
+            run = apify_client.get_run(run_id)
+        except ApifyClientError as exc:
+            raise ApifyIntegrationError(str(exc)) from exc
+
+        dataset_id = (
+            run.get("defaultDatasetId")
+            or run.get("_defaultDatasetId")
+            or (run.get("data") or {}).get("defaultDatasetId")
+        )
+        if not dataset_id:
+            raise ApifyIntegrationError("Apify run did not expose a dataset of items.")
+
+        try:
+            raw_items = apify_client.get_dataset_items(dataset_id, limit=effective_limit)
+        except ApifyClientError as exc:
+            raise ApifyIntegrationError(str(exc)) from exc
+
+        kv_store_id = (
+            run.get("defaultKeyValueStoreId")
+            or run.get("_defaultKeyValueStoreId")
+            or (run.get("data") or {}).get("defaultKeyValueStoreId")
+        )
+        run_input: Dict[str, Any] = {}
+        if kv_store_id:
+            try:
+                fetched_input = apify_client.get_key_value_record(kv_store_id, "INPUT")
+                if isinstance(fetched_input, dict):
+                    run_input = fetched_input
+            except ApifyClientError:
+                run_input = {}
+
+        if not isinstance(run_input, dict):
+            run_input = {}
+
+        if "directUrls" not in run_input or not run_input.get("directUrls"):
+            direct_urls: List[str] = []
+            for item in raw_items:
+                input_url = item.get("inputUrl") or item.get("input_url")
+                if isinstance(input_url, str) and input_url:
+                    direct_urls.append(input_url.strip())
+            if direct_urls:
+                ordered_urls: List[str] = []
+                seen: Set[str] = set()
+                for url in direct_urls:
+                    normalized = url if url.endswith("/") else f"{url}/"
+                    if normalized in seen:
+                        continue
+                    seen.add(normalized)
+                    ordered_urls.append(normalized)
+                run_input = {
+                    **run_input,
+                    "directUrls": ordered_urls,
+                }
+
+        if not run_input.get("username"):
+            usernames: List[str] = []
+            direct_urls = run_input.get("directUrls")
+            if isinstance(direct_urls, list):
+                for url in direct_urls:
+                    if isinstance(url, str):
+                        extracted = self._extract_username_from_item({"inputUrl": url})
+                        if extracted:
+                            usernames.append(extracted)
+            if not usernames:
+                for item in raw_items:
+                    extracted = self._extract_username_from_item(item)
+                    if extracted:
+                        usernames.append(extracted)
+            if usernames:
+                run_input = {
+                    **run_input,
+                    "username": usernames,
+                }
+
+        normalized_posts = self._convert_items_to_posts(raw_items, username=None, limit=effective_limit)
+        return {
+            "input": run_input,
+            "items": raw_items,
+            "posts": normalized_posts,
+            "runner": "rest",
+        }
+
+    def import_apify_posts(
+        self,
+        session: Session,
+        settings,
+        posts_data: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        stats = {
+            "attempted": len(posts_data),
+            "created": 0,
+            "skipped_existing": 0,
+            "missing_clubs": 0,
+        }
+        if not posts_data:
+            stats["message"] = "No posts were imported."
+            return stats
+
+        global_auto = (settings.classification_mode or ClassificationModeEnum.MANUAL).lower() == ClassificationModeEnum.AUTO
+        known_ids_cache: Dict[int, Set[str]] = {}
+
+        for item in posts_data:
+            username_value = item.get("username")
+            username = (username_value or "").lstrip("@").strip("/")
+            if not username:
+                stats["missing_clubs"] += 1
+                continue
+
+            club = session.query(Club).filter(Club.username == username).one_or_none()
+            if not club:
+                stats["missing_clubs"] += 1
+                continue
+
+            known_ids = known_ids_cache.get(club.id)
+            if known_ids is None:
+                known_ids = self._get_recent_post_ids(session, club.id)
+                known_ids_cache[club.id] = known_ids
+
+            timestamp_value = item.get("timestamp")
+            timestamp_dt = datetime.utcnow()
+            if isinstance(timestamp_value, str):
+                try:
+                    timestamp_dt = datetime.fromisoformat(timestamp_value.replace("Z", "+00:00")).replace(tzinfo=None)
+                except ValueError:
+                    pass
+
+            auto_classify = global_auto and (club.classification_mode or ClassificationModeEnum.MANUAL).lower() == ClassificationModeEnum.AUTO
+            post_payload = {
+                "id": item.get("id"),
+                "caption": item.get("caption") or "",
+                "image_url": item.get("image_url"),
+                "timestamp": timestamp_dt,
+                "is_video": bool(item.get("is_video")),
+            }
+
+            if not post_payload["id"]:
+                stats["missing_clubs"] += 1
+                continue
+
+            created = self._create_post_if_new(session, club, post_payload, auto_classify)
+            if created:
+                stats["created"] += 1
+                known_ids.add(post_payload["id"])
+                club.last_checked = datetime.utcnow()
+            else:
+                stats["skipped_existing"] += 1
+
+        session.commit()
+
+        if stats["created"]:
+            message = f"Imported {stats['created']} new post(s) from Apify snapshot."
+        elif stats["skipped_existing"]:
+            message = "No new posts imported; all posts already exist."
+        elif stats["missing_clubs"]:
+            message = "Skipped posts because matching clubs were not found."
+        else:
+            message = "No posts were imported."
+        stats["message"] = message
+        return stats
+
+    def _convert_items_to_posts(
+        self,
+        items: List[Dict[str, Any]],
+        username: Optional[str] = None,
+        limit: int = 10,
+    ) -> List[Dict[str, Any]]:
+        posts: List[Dict[str, Any]] = []
+        effective_limit = max(limit or 0, 0)
+        for item in items:
+            item_username = self._extract_username_from_item(item)
+            if username and item_username and item_username != username:
+                continue
+            shortcode = item.get("shortCode") or item.get("shortcode") or item.get("id")
+            if not shortcode:
+                continue
+            timestamp_value = item.get("timestamp")
+            timestamp_dt = datetime.utcnow()
+            if isinstance(timestamp_value, str):
+                try:
+                    timestamp_dt = datetime.fromisoformat(timestamp_value.replace("Z", "+00:00")).replace(tzinfo=None)
+                except ValueError:
+                    pass
+            caption = item.get("caption") or ""
+            image_url = item.get("displayUrl") or item.get("display_url")
+            if not image_url:
+                images = item.get("images") or []
+                if images:
+                    first = images[0]
+                    if isinstance(first, dict):
+                        image_url = first.get("url") or first.get("displayUrl")
+            permalink = item.get("url") or item.get("permalink")
+            if not permalink and shortcode:
+                product_type = (item.get("productType") or item.get("type") or "").lower()
+                path_segment = "reel" if "reel" in product_type else "p"
+                permalink = f"https://www.instagram.com/{path_segment}/{shortcode}/"
+            posts.append(
+                {
+                    "id": shortcode,
+                    "username": item_username or username,
+                    "caption": caption,
+                    "image_url": image_url,
+                    "timestamp": timestamp_dt.isoformat(),
+                    "is_video": item.get("type") == "Video",
+                    "permalink": permalink,
+                }
+            )
+            if username and effective_limit and len(posts) >= effective_limit:
+                break
+        posts.sort(
+            key=lambda x: datetime.fromisoformat(x["timestamp"]) if x.get("timestamp") else datetime.min,
+            reverse=True,
+        )
+        if not username and effective_limit:
+            return posts[:effective_limit]
+        return posts
     def _collect_posts_via_apify_bulk(
         self,
         client: ApifyClient,
@@ -636,13 +1025,26 @@ class MonitorService:
             if not chunk:
                 return
             chunk_limit = max(limit_per_username * len(chunk), limit_per_username, 1)
+            usernames_payload: List[str] = []
+            profile_urls: List[str] = []
+            for identifier in chunk:
+                cleaned = (identifier or "").strip()
+                if not cleaned:
+                    continue
+                normalized_username = cleaned.lstrip("@").strip("/")
+                if not normalized_username:
+                    continue
+                usernames_payload.append(normalized_username)
+                profile_urls.append(f"https://www.instagram.com/{normalized_username}/")
+            if not usernames_payload:
+                return
             run_input = {
                 **APIFY_DEFAULT_INPUT,
-                "directUrls": [f"https://www.instagram.com/{username}/" for username in chunk],
-                "resultsType": "posts",
+                "username": usernames_payload,
                 "resultsLimit": chunk_limit,
                 "maxItems": chunk_limit,
             }
+            run_input["directUrls"] = profile_urls
             try:
                 items = client.run_and_collect(
                     run_input,

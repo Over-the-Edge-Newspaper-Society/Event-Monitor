@@ -23,7 +23,7 @@ from sqlalchemy.orm import relationship
 from .database import Base
 
 
-DEFAULT_APIFY_ACTOR_ID = "shu8hvrXbJbY3Eb9W"
+DEFAULT_APIFY_ACTOR_ID = "nH2AHrwxeTRJoN5hX"
 
 
 class ClassificationModeEnum(str):

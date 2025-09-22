@@ -13,7 +13,15 @@ from fastapi.staticfiles import StaticFiles
 from sqlalchemy.orm import Session, joinedload
 
 from .database import SessionLocal, engine
-from .models import Base, Club, ExtractedEvent, Post, ClassificationModeEnum, ensure_default_settings
+from .models import (
+    Base,
+    Club,
+    ExtractedEvent,
+    Post,
+    ClassificationModeEnum,
+    ensure_default_settings,
+    DEFAULT_APIFY_ACTOR_ID,
+)
 from .schemas import (
     CSVImportResponse,
     ClubOut,
@@ -26,6 +34,11 @@ from .schemas import (
     SystemSettingsOut,
     SystemSettingsUpdate,
     ApifyTokenUpdate,
+    ApifyTestRequest,
+    ApifyTestResponse,
+    ClubFetchLatestResponse,
+    DeletePostResponse,
+    ApifyImportStats,
 )
 from .services.monitor import monitor_service, RateLimitError, ApifyIntegrationError
 from .utils.apify_client import ApifyRunTimeoutError
@@ -141,8 +154,7 @@ async def update_system_settings(
         settings.apify_enabled = payload.apify_enabled
         updated = True
     if payload.apify_actor_id is not None:
-        cleaned_actor = payload.apify_actor_id.strip() or None
-        settings.apify_actor_id = cleaned_actor
+        settings.apify_actor_id = DEFAULT_APIFY_ACTOR_ID
         updated = True
     if payload.apify_results_limit is not None:
         settings.apify_results_limit = payload.apify_results_limit
@@ -182,6 +194,133 @@ async def clear_apify_token(db: Session = Depends(get_db)) -> SystemSettingsOut:
     db.refresh(settings)
     monitor_service.clear_last_error()
     return _system_settings_out(settings)
+
+
+@app.post("/apify/test", response_model=ApifyTestResponse)
+async def run_apify_test(
+    payload: ApifyTestRequest,
+    db: Session = Depends(get_db),
+) -> ApifyTestResponse:
+    settings = ensure_default_settings(db)
+    target_url = (payload.url or "").strip()
+    if not target_url:
+        raise HTTPException(status_code=400, detail="Instagram URL or username is required")
+
+    configured_limit = settings.apify_results_limit or 10
+    requested_limit = payload.limit or configured_limit
+    limit = max(1, min(requested_limit, configured_limit))
+
+    try:
+        return ApifyTestResponse(**monitor_service.test_apify_fetch(settings, target_url, limit=limit))
+    except ApifyIntegrationError as exc:
+        detail = str(exc) or "Apify integration failed to return results."
+        raise HTTPException(status_code=502, detail=detail)
+    except ApifyRunTimeoutError as exc:
+        detail = str(exc) or "Apify run timed out before completion."
+        raise HTTPException(status_code=504, detail=detail)
+
+
+@app.get("/apify/run/{run_id}", response_model=ApifyTestResponse)
+async def fetch_apify_run(
+    run_id: str,
+    limit: int = 10,
+    db: Session = Depends(get_db),
+) -> ApifyTestResponse:
+    settings = ensure_default_settings(db)
+    try:
+        return ApifyTestResponse(
+            **monitor_service.fetch_apify_run_snapshot(settings, run_id, limit=limit)
+        )
+    except ApifyIntegrationError as exc:
+        detail = str(exc) or "Apify integration failed to return results."
+        raise HTTPException(status_code=502, detail=detail)
+
+
+@app.post("/apify/run/{run_id}/import", response_model=ApifyImportStats)
+async def import_apify_run(
+    run_id: str,
+    limit: int = 10,
+    db: Session = Depends(get_db),
+) -> ApifyImportStats:
+    settings = ensure_default_settings(db)
+    try:
+        snapshot = monitor_service.fetch_apify_run_snapshot(settings, run_id, limit=limit)
+        stats = monitor_service.import_apify_posts(db, settings, snapshot["posts"])
+        return ApifyImportStats(**stats)
+    except ApifyIntegrationError as exc:
+        detail = str(exc) or "Apify integration failed to return results."
+        raise HTTPException(status_code=502, detail=detail)
+    except ApifyRunTimeoutError as exc:
+        detail = str(exc) or "Apify run timed out before completion."
+        raise HTTPException(status_code=504, detail=detail)
+
+
+@app.post("/clubs/{club_id}/fetch-latest", response_model=ClubFetchLatestResponse)
+async def fetch_latest_for_club(
+    club_id: int,
+    post_count: int = 1,
+    db: Session = Depends(get_db),
+) -> ClubFetchLatestResponse:
+    if post_count < 1:
+        raise HTTPException(status_code=400, detail="post_count must be at least 1")
+
+    club = db.query(Club).filter(Club.id == club_id).one_or_none()
+    if not club:
+        raise HTTPException(status_code=404, detail="Club not found")
+
+    settings = ensure_default_settings(db)
+    fetch_mode = monitor_service._get_fetch_mode(settings)
+    apify_ready = bool(settings.apify_api_token and settings.apify_actor_id)
+    has_loader = bool(monitor_service.loader)
+
+    if fetch_mode == "instaloader" and not has_loader:
+        raise HTTPException(
+            status_code=503,
+            detail="Instaloader session is not available. Upload a session file or switch fetcher.",
+        )
+    if fetch_mode == "apify" and not apify_ready:
+        raise HTTPException(
+            status_code=503,
+            detail="Apify integration is not configured. Add a personal API token and actor ID before using Apify mode.",
+        )
+    if fetch_mode == "auto" and not has_loader and not apify_ready:
+        raise HTTPException(
+            status_code=503,
+            detail="No Instagram fetcher is ready. Provide an Instaloader session or Apify credentials.",
+        )
+
+    try:
+        stats = monitor_service.fetch_latest_posts_for_club(db, club, post_count, settings)
+    except RateLimitError as exc:
+        db.rollback()
+        detail = str(exc) or "Instagram temporarily blocked our requests. Please try again later."
+        raise HTTPException(status_code=429, detail=detail)
+    except ApifyIntegrationError as exc:
+        db.rollback()
+        detail = str(exc) or "Apify integration failed to return results."
+        raise HTTPException(status_code=502, detail=detail)
+    except ApifyRunTimeoutError as exc:
+        db.rollback()
+        detail = str(exc) or "Apify run timed out before completion."
+        raise HTTPException(status_code=504, detail=detail)
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception as exc:
+        db.rollback()
+        import traceback
+
+        print(f"Error in fetch_latest_for_club: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=f"Error fetching posts: {exc}")
+
+    return ClubFetchLatestResponse(
+        club_id=club.id,
+        club_username=club.username,
+        requested=stats["requested"],
+        fetched=stats["fetched"],
+        created=stats["created"],
+        message=stats["message"],
+    )
 
 
 @app.post("/settings/session", response_model=SystemSettingsOut)
@@ -371,7 +510,8 @@ async def fetch_latest_posts_stream(post_count: int = 3, db: Session = Depends(g
                     club.username: monitor_service._get_recent_post_ids(db, club.id)
                     for club in clubs
                 }
-                limit = settings.apify_results_limit or post_count
+                configured_limit = settings.apify_results_limit or post_count
+                limit = max(1, min(configured_limit, post_count))
                 try:
                     apify_bulk_cache = monitor_service._collect_posts_via_apify_bulk(
                         apify_client,
@@ -534,6 +674,16 @@ async def attach_event(
     return post
 
 
+@app.delete("/posts/{post_id}", response_model=DeletePostResponse)
+async def delete_post(post_id: int, db: Session = Depends(get_db)) -> DeletePostResponse:
+    post = db.query(Post).filter(Post.id == post_id).one_or_none()
+    if not post:
+        raise HTTPException(status_code=404, detail="Post not found")
+    db.delete(post)
+    db.commit()
+    return DeletePostResponse(id=post_id, success=True)
+
+
 @app.get("/stats", response_model=StatsOut)
 async def stats(db: Session = Depends(get_db)) -> StatsOut:
     total_clubs = db.query(Club).count()
@@ -561,6 +711,7 @@ def _render_status(settings) -> MonitorStatus:
         delta = now - uploaded_at
         session_age_minutes = max(int(delta.total_seconds() // 60), 0)
     is_rate_limited = bool(rate_limit_until and rate_limit_until > now)
+    apify_runner = monitor_service.get_apify_runner_status(settings)
     return MonitorStatus(
         monitoring_enabled=settings.monitoring_enabled,
         monitor_interval_minutes=settings.monitor_interval_minutes,
@@ -569,6 +720,7 @@ def _render_status(settings) -> MonitorStatus:
         classification_mode=settings.classification_mode,
         apify_enabled=settings.apify_enabled,
         instagram_fetcher=settings.instagram_fetcher,
+        apify_runner=apify_runner,
         last_error=monitor_service.last_error,
         session_username=settings.instaloader_username,
         session_uploaded_at=session_uploaded_iso,

@@ -13,6 +13,7 @@ import {
   Settings,
   Upload,
   Zap,
+  Trash2,
 } from "lucide-react";
 
 const RAW_API_BASE = import.meta.env.VITE_API_BASE ?? "http://localhost:8000";
@@ -39,6 +40,7 @@ interface MonitorStatus {
   last_error: string | null;
   apify_enabled: boolean;
   instagram_fetcher: FetcherMode;
+  apify_runner: ApifyRunnerMode;
   session_username: string | null;
   session_uploaded_at: string | null;
   session_age_minutes: number | null;
@@ -98,11 +100,54 @@ interface SystemSettings {
 }
 
 type FetcherMode = "auto" | "instaloader" | "apify";
+type ApifyRunnerMode = "disabled" | "unconfigured" | "rest" | "rest_fallback" | "node";
+
+interface ApifyTestPost {
+  id: string;
+  username?: string | null;
+  caption?: string | null;
+  image_url?: string | null;
+  timestamp?: string | null;
+  is_video: boolean;
+  permalink?: string | null;
+}
+
+interface ApifyTestResult {
+  runner: ApifyRunnerMode;
+  input: Record<string, unknown>;
+  items: Record<string, unknown>[];
+  posts: ApifyTestPost[];
+}
+
+interface ClubFetchLatestResponse {
+  club_id: number;
+  club_username: string;
+  requested: number;
+  fetched: number;
+  created: number;
+  message: string;
+}
+
+interface ApifyImportStats {
+  attempted: number;
+  created: number;
+  skipped_existing: number;
+  missing_clubs: number;
+  message: string;
+}
 
 const FETCHER_LABELS: Record<FetcherMode, string> = {
   auto: "Auto (hybrid)",
   instaloader: "Instaloader only",
   apify: "Apify only",
+};
+
+const APIFY_RUNNER_LABELS: Record<ApifyRunnerMode, string> = {
+  disabled: "Disabled",
+  unconfigured: "Missing token",
+  rest: "REST polling",
+  rest_fallback: "REST (Node unavailable)",
+  node: "Node SDK",
 };
 
 const tabs = [
@@ -113,6 +158,11 @@ const tabs = [
 ] as const;
 
 type TabId = (typeof tabs)[number]["id"];
+
+const APIFY_SAMPLE_ACCOUNTS = [
+  { label: "humansofny", url: "https://www.instagram.com/humansofny/" },
+  { label: "unbcpion", url: "https://www.instagram.com/unbcpion/" },
+] as const;
 
 const App = () => {
   const [activeTab, setActiveTab] = useState<TabId>("setup");
@@ -139,13 +189,25 @@ const App = () => {
   const [sessionFileKey, setSessionFileKey] = useState(() => Date.now().toString());
   const [sessionCookieInput, setSessionCookieInput] = useState("");
   const [apifyEnabledInput, setApifyEnabledInput] = useState(false);
-  const [apifyActorInput, setApifyActorInput] = useState("");
   const [apifyResultsLimitInput, setApifyResultsLimitInput] = useState<number>(30);
   const [apifyTokenInput, setApifyTokenInput] = useState("");
   const [isSavingApifySettings, setIsSavingApifySettings] = useState(false);
   const [isSavingApifyToken, setIsSavingApifyToken] = useState(false);
   const [isClearingApifyToken, setIsClearingApifyToken] = useState(false);
   const [apifyFetcherMode, setApifyFetcherMode] = useState<FetcherMode>("auto");
+  const [apifyTestUrl, setApifyTestUrl] = useState("https://www.instagram.com/humansofny/");
+  const [apifyTestLimit, setApifyTestLimit] = useState<number>(1);
+  const [apifyTestResult, setApifyTestResult] = useState<ApifyTestResult | null>(null);
+  const [isRunningApifyTest, setIsRunningApifyTest] = useState(false);
+  const [apifyTestError, setApifyTestError] = useState<string | null>(null);
+  const [apifyRunIdInput, setApifyRunIdInput] = useState("");
+  const [apifyRunLimit, setApifyRunLimit] = useState<number>(10);
+  const [isFetchingApifyRun, setIsFetchingApifyRun] = useState(false);
+  const [apifyResultSummary, setApifyResultSummary] = useState<string | null>(null);
+  const [fetchingClubId, setFetchingClubId] = useState<number | null>(null);
+  const [deletingPostId, setDeletingPostId] = useState<number | null>(null);
+  const [isImportingApifyRun, setIsImportingApifyRun] = useState(false);
+  const [lastLoadedRunId, setLastLoadedRunId] = useState<string | null>(null);
 
   // Helper function to get the appropriate image URL
   const getImageUrl = (post: PostRecord): string | null => {
@@ -156,18 +218,23 @@ const App = () => {
     return post.image_url || null;
   };
 
-  const pendingPosts = useMemo(
-    () => posts.filter((post) => post.is_event_poster === null),
-    [posts]
-  );
   const eventPosts = useMemo(
     () => posts.filter((post) => post.is_event_poster === true),
     [posts]
   );
-  const nonEventPosts = useMemo(
-    () => posts.filter((post) => post.is_event_poster === false),
-    [posts]
-  );
+  const reviewQueue = useMemo(() => {
+    return posts
+      .filter((post) => post.is_event_poster === null || post.is_event_poster === true)
+      .map((post) => ({
+        post,
+        source: post.is_event_poster === true ? "ai" : "manual",
+      }))
+      .sort((a, b) => {
+        const aTime = new Date(a.post.post_timestamp).getTime();
+        const bTime = new Date(b.post.post_timestamp).getTime();
+        return bTime - aTime;
+      });
+  }, [posts]);
 
   const handleApiError = useCallback((message: string) => {
     setError(message);
@@ -249,7 +316,6 @@ const App = () => {
     if (systemSettings) {
       setSessionUsernameInput(systemSettings.instaloader_username ?? "");
       setClubDelayInput(systemSettings.club_fetch_delay_seconds);
-      setApifyActorInput(systemSettings.apify_actor_id ?? "");
       setApifyResultsLimitInput(systemSettings.apify_results_limit);
       const fetcher = systemSettings.instagram_fetcher ?? "auto";
       setApifyFetcherMode(fetcher);
@@ -289,6 +355,72 @@ const App = () => {
       showSuccess(`${club.name} classification set to ${nextMode.toUpperCase()}`);
     } catch (err) {
       handleApiError((err as Error).message);
+    }
+  };
+
+  const handleFetchLatestForClub = async (club: Club, postCount: number = 1) => {
+    try {
+      setFetchingClubId(club.id);
+      const response = await fetch(`${API_BASE}/clubs/${club.id}/fetch-latest?post_count=${postCount}`, {
+        method: "POST",
+      });
+      if (!response.ok) {
+        const text = await response.text();
+        let detail = text || `Failed to fetch posts for ${club.name}`;
+        if (text) {
+          try {
+            const payload = JSON.parse(text);
+            detail =
+              (typeof payload.detail === "string" && payload.detail) ||
+              (typeof payload.error === "string" && payload.error) ||
+              detail;
+          } catch {
+            detail = text;
+          }
+        }
+        throw new Error(detail);
+      }
+      const data: ClubFetchLatestResponse = await response.json();
+      await refreshAll();
+      showSuccess(data.message);
+    } catch (err) {
+      handleApiError((err as Error).message);
+    } finally {
+      setFetchingClubId(null);
+    }
+  };
+
+  const handleDeletePost = async (post: PostRecord) => {
+    if (!confirm(`Delete post ${post.instagram_id}? This cannot be undone.`)) {
+      return;
+    }
+    try {
+      setDeletingPostId(post.id);
+      const response = await fetch(`${API_BASE}/posts/${post.id}`, {
+        method: "DELETE",
+      });
+      if (!response.ok) {
+        const text = await response.text();
+        let detail = text || "Failed to delete post";
+        if (text) {
+          try {
+            const payload = JSON.parse(text);
+            detail =
+              (typeof payload.detail === "string" && payload.detail) ||
+              (typeof payload.error === "string" && payload.error) ||
+              detail;
+          } catch {
+            detail = text;
+          }
+        }
+        throw new Error(detail);
+      }
+      await refreshAll();
+      showSuccess(`Deleted post ${post.instagram_id}.`);
+    } catch (err) {
+      handleApiError((err as Error).message);
+    } finally {
+      setDeletingPostId(null);
     }
   };
 
@@ -412,7 +544,6 @@ const App = () => {
       const payload: Record<string, unknown> = {
         apify_enabled: apifyEnabledInput,
         apify_results_limit: apifyResultsLimitInput,
-        apify_actor_id: apifyActorInput.trim() || null,
         instagram_fetcher: apifyFetcherMode,
       };
       const response = await fetch(`${API_BASE}/settings`, {
@@ -639,6 +770,152 @@ const App = () => {
     }
   };
 
+  const handleRunApifyTest = useCallback(
+    async (urlOverride?: string, limitOverride?: number) => {
+      const rawUrl = urlOverride ?? apifyTestUrl;
+      const targetUrl = rawUrl.trim();
+      const requestedLimit = limitOverride ?? apifyTestLimit;
+      const normalizedLimit = Math.min(Math.max(Math.round(requestedLimit), 1), 100);
+
+      if (!targetUrl) {
+        setApifyTestError("Provide an Instagram URL or username before running the test.");
+        return;
+      }
+
+      setApifyTestUrl(targetUrl);
+      setApifyTestLimit(normalizedLimit);
+      setIsRunningApifyTest(true);
+      setApifyTestError(null);
+      setApifyResultSummary(null);
+      setLastLoadedRunId(null);
+
+      try {
+        const response = await fetch(`${API_BASE}/apify/test`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ url: targetUrl, limit: normalizedLimit }),
+        });
+
+        if (!response.ok) {
+          let detail = "Failed to run Apify test.";
+          const text = await response.text();
+          if (text) {
+            try {
+              const payload = JSON.parse(text);
+              detail =
+                (typeof payload.detail === "string" && payload.detail) ||
+                (typeof payload.error === "string" && payload.error) ||
+                detail;
+            } catch {
+              detail = text;
+            }
+          }
+          setApifyTestError(detail);
+          return;
+        }
+
+        const data: ApifyTestResult = await response.json();
+        setApifyTestResult(data);
+        setApifyResultSummary(`Live test run for ${targetUrl}`);
+      } catch (err) {
+        setApifyTestError(err instanceof Error ? err.message : "Failed to run Apify test.");
+      } finally {
+        setIsRunningApifyTest(false);
+      }
+    },
+    [apifyTestUrl, apifyTestLimit]
+  );
+
+  const handleFetchApifyRun = useCallback(async () => {
+    const runId = apifyRunIdInput.trim();
+    const normalizedLimit = Math.min(Math.max(Math.round(apifyRunLimit), 1), 100);
+    if (!runId) {
+      setApifyTestError("Paste an Apify run ID before loading results.");
+      return;
+    }
+
+    setApifyRunLimit(normalizedLimit);
+    setIsFetchingApifyRun(true);
+    setApifyTestError(null);
+    setApifyResultSummary(null);
+
+    try {
+      const response = await fetch(
+        `${API_BASE}/apify/run/${encodeURIComponent(runId)}?limit=${normalizedLimit}`
+      );
+
+      if (!response.ok) {
+        let detail = "Failed to load Apify run.";
+        const text = await response.text();
+        if (text) {
+          try {
+            const payload = JSON.parse(text);
+            detail =
+              (typeof payload.detail === "string" && payload.detail) ||
+              (typeof payload.error === "string" && payload.error) ||
+              detail;
+          } catch {
+            detail = text;
+          }
+        }
+        setApifyTestError(detail);
+        return;
+      }
+
+      const data: ApifyTestResult = await response.json();
+      setApifyTestResult(data);
+      setApifyResultSummary(`Snapshot from Apify run ${runId}`);
+      setLastLoadedRunId(runId);
+      const userInputs = Array.isArray(data.input?.username) ? data.input?.username : [];
+      if (userInputs && userInputs.length > 0) {
+        setApifyTestUrl(String(userInputs[0] ?? ""));
+      } else if (Array.isArray(data.input?.directUrls) && data.input.directUrls.length > 0) {
+        setApifyTestUrl(String(data.input.directUrls[0] ?? ""));
+      }
+    } catch (err) {
+      setApifyTestError(err instanceof Error ? err.message : "Failed to load Apify run.");
+    } finally {
+      setIsFetchingApifyRun(false);
+    }
+  }, [apifyRunIdInput, apifyRunLimit]);
+
+  const handleImportApifyRun = useCallback(async () => {
+    if (!lastLoadedRunId) {
+      setApifyTestError("Load an Apify run before importing posts.");
+      return;
+    }
+    try {
+      setIsImportingApifyRun(true);
+      const response = await fetch(
+        `${API_BASE}/apify/run/${encodeURIComponent(lastLoadedRunId)}/import?limit=${apifyRunLimit}`,
+        { method: "POST" }
+      );
+      if (!response.ok) {
+        const text = await response.text();
+        let detail = text || "Failed to import posts from Apify run.";
+        if (text) {
+          try {
+            const payload = JSON.parse(text);
+            detail =
+              (typeof payload.detail === "string" && payload.detail) ||
+              (typeof payload.error === "string" && payload.error) ||
+              detail;
+          } catch {
+            detail = text;
+          }
+        }
+        throw new Error(detail);
+      }
+      const data: ApifyImportStats = await response.json();
+      await refreshAll();
+      showSuccess(data.message);
+    } catch (err) {
+      setApifyTestError(err instanceof Error ? err.message : "Failed to import posts from Apify run.");
+    } finally {
+      setIsImportingApifyRun(false);
+    }
+  }, [lastLoadedRunId, apifyRunLimit, refreshAll, showSuccess]);
+
   const handleManualClassification = async (post: PostRecord, isEvent: boolean) => {
     try {
       const response = await fetch(`${API_BASE}/posts/${post.id}/classify`, {
@@ -753,6 +1030,20 @@ const App = () => {
     return `${minutes} min`;
   };
 
+  const apifyPosts = apifyTestResult?.posts ?? [];
+  const apifyDirectUrls = Array.isArray(apifyTestResult?.input?.directUrls)
+    ? (apifyTestResult?.input?.directUrls as string[])
+    : [];
+  const apifyUsernameInputs = Array.isArray(apifyTestResult?.input?.username)
+    ? (apifyTestResult?.input?.username as string[])
+    : [];
+  const apifyRunnerLabel =
+    apifyTestResult ? APIFY_RUNNER_LABELS[apifyTestResult.runner] ?? apifyTestResult.runner : null;
+  const apifyRawItemCount = apifyTestResult?.items?.length ?? 0;
+  const apifyUniqueUsernames = Array.from(
+    new Set(apifyPosts.map((post) => (post.username ? post.username.replace(/^@/, "") : null)).filter(Boolean))
+  ) as string[];
+
   return (
     <div className="min-h-screen bg-slate-100">
       <div className="max-w-7xl mx-auto px-4 py-8 space-y-6">
@@ -845,6 +1136,14 @@ const App = () => {
                       >
                         Mode: {club.classification_mode.toUpperCase()}
                       </button>
+                      <button
+                        onClick={() => handleFetchLatestForClub(club, 1)}
+                        disabled={fetchingClubId === club.id}
+                        className="flex items-center gap-1 text-xs text-blue-600 hover:text-blue-800 disabled:opacity-60"
+                      >
+                        <RefreshCcw className={`h-3.5 w-3.5 ${fetchingClubId === club.id ? "animate-spin" : ""}`} />
+                        {fetchingClubId === club.id ? "Fetching..." : "Fetch 1 post"}
+                      </button>
                     </div>
                   </div>
                 ))}
@@ -934,35 +1233,26 @@ const App = () => {
                   />
                   Enable Apify fallback (used in auto mode)
                 </label>
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                  <div>
-                    <label className="block text-sm font-medium text-gray-700">Actor ID</label>
-                    <input
-                      type="text"
-                      value={apifyActorInput}
-                      onChange={(event) => setApifyActorInput(event.target.value)}
-                      placeholder="shu8hvrXbJbY3Eb9W"
-                      className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:border-purple-500 focus:outline-none focus:ring-2 focus:ring-purple-200"
-                    />
-                    <p className="text-xs text-gray-500 mt-1">Use the actor ID from Apify (default scraper shown).</p>
-                  </div>
-                  <div>
-                    <label className="block text-sm font-medium text-gray-700">Results limit per club</label>
-                    <input
-                      type="number"
-                      min={1}
-                      max={1000}
-                      value={apifyResultsLimitInput}
-                      onChange={(event) => {
-                        const value = Number(event.target.value);
-                        if (!Number.isNaN(value)) {
-                          setApifyResultsLimitInput(Math.min(Math.max(1, Math.round(value)), 1000));
-                        }
-                      }}
-                      className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:border-purple-500 focus:outline-none focus:ring-2 focus:ring-purple-200"
-                    />
-                    <p className="text-xs text-gray-500 mt-1">How many posts to request from Apify when invoked.</p>
-                  </div>
+                <p className="text-xs text-gray-500">
+                  Using Apify actor <span className="font-mono">nH2AHrwxeTRJoN5hX</span>. Override this by setting
+                  the <span className="font-mono">APIFY_ACTOR_ID</span> environment variable if needed.
+                </p>
+                <div>
+                  <label className="block text-sm font-medium text-gray-700">Results limit per club</label>
+                  <input
+                    type="number"
+                    min={1}
+                    max={1000}
+                    value={apifyResultsLimitInput}
+                    onChange={(event) => {
+                      const value = Number(event.target.value);
+                      if (!Number.isNaN(value)) {
+                        setApifyResultsLimitInput(Math.min(Math.max(1, Math.round(value)), 1000));
+                      }
+                    }}
+                    className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:border-purple-500 focus:outline-none focus:ring-2 focus:ring-purple-200"
+                  />
+                  <p className="text-xs text-gray-500 mt-1">How many posts to request from Apify when invoked.</p>
                 </div>
                 <div className="flex flex-wrap items-center gap-3">
                   <button
@@ -973,7 +1263,7 @@ const App = () => {
                     {isSavingApifySettings ? "Saving..." : "Save Apify settings"}
                   </button>
                   <span className="text-xs text-gray-500">
-                    Actor and limit updates apply immediately to the next monitor run.
+                    Limit and fetcher updates apply immediately to the next monitor run.
                   </span>
                 </div>
 
@@ -1177,6 +1467,9 @@ const App = () => {
                   <p className="text-xs text-blue-500 mt-1">
                     Apify fallback: {status?.apify_enabled ? "Enabled" : "Disabled"}
                   </p>
+                  <p className="text-xs text-blue-500 mt-1">
+                    Apify runner: {status ? APIFY_RUNNER_LABELS[status.apify_runner] : "—"}
+                  </p>
                 </div>
                 <div className="bg-purple-50 rounded-lg p-4">
                   <p className="text-sm text-purple-900">Last Run</p>
@@ -1253,6 +1546,292 @@ const App = () => {
                   Manually fetch the latest posts from all active clubs. This will collect recent posts regardless of the last check time.
                 </p>
               </div>
+
+              <div className="border-t pt-6">
+                <h3 className="text-lg font-semibold mb-4">Apify Test Runner</h3>
+                <div className="space-y-4">
+                  <div className="grid grid-cols-1 md:grid-cols-[2fr,auto] gap-3">
+                    <div>
+                      <label className="block text-sm font-medium text-gray-700">Instagram URL or username</label>
+                      <input
+                        type="text"
+                        value={apifyTestUrl}
+                        onChange={(event) => setApifyTestUrl(event.target.value)}
+                        placeholder="https://www.instagram.com/humansofny/"
+                        className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:border-purple-500 focus:outline-none focus:ring-2 focus:ring-purple-200"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-sm font-medium text-gray-700">Posts to fetch</label>
+                      <input
+                        type="number"
+                        min={1}
+                        max={100}
+                        step={1}
+                        value={apifyTestLimit}
+                        onChange={(event) => {
+                          const value = Number(event.target.value);
+                          if (Number.isNaN(value)) {
+                            setApifyTestLimit(1);
+                            return;
+                          }
+                          setApifyTestLimit(Math.min(Math.max(Math.round(value), 1), 100));
+                        }}
+                        className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:border-purple-500 focus:outline-none focus:ring-2 focus:ring-purple-200"
+                      />
+                    </div>
+                  </div>
+
+                  <div className="flex flex-wrap items-center gap-3">
+                    <button
+                      type="button"
+                      onClick={() => handleRunApifyTest()}
+                      disabled={isRunningApifyTest || isFetchingApifyRun}
+                      className="px-4 py-2 bg-purple-600 hover:bg-purple-700 disabled:bg-purple-400 text-white rounded-lg text-sm font-medium flex items-center gap-2"
+                    >
+                      <RefreshCcw className={`h-4 w-4 ${isRunningApifyTest ? "animate-spin" : ""}`} />
+                      {isRunningApifyTest ? "Running test..." : "Run Apify test"}
+                    </button>
+                    {APIFY_SAMPLE_ACCOUNTS.map((sample) => (
+                      <button
+                        key={sample.url}
+                        type="button"
+                        disabled={isRunningApifyTest || isFetchingApifyRun}
+                        onClick={() => handleRunApifyTest(sample.url, 1)}
+                        className="px-3 py-2 rounded-lg border border-gray-300 text-xs font-medium text-gray-600 hover:border-purple-500 hover:text-purple-600 disabled:opacity-60"
+                      >
+                        Sample: {sample.label}
+                      </button>
+                    ))}
+                  </div>
+
+                  <div className="rounded-lg border border-gray-200 bg-white p-4 space-y-3">
+                    <p className="text-sm font-semibold text-gray-700">Load existing Apify run</p>
+                    <div className="grid grid-cols-1 md:grid-cols-[2fr,auto] gap-3">
+                      <div>
+                        <label className="block text-sm font-medium text-gray-700">Run ID</label>
+                        <input
+                          type="text"
+                          value={apifyRunIdInput}
+                          onChange={(event) => setApifyRunIdInput(event.target.value)}
+                          placeholder="5TOhNTdGxG0CxF9Ln"
+                          className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:border-purple-500 focus:outline-none focus:ring-2 focus:ring-purple-200"
+                        />
+                      </div>
+                      <div>
+                        <label className="block text-sm font-medium text-gray-700">Posts to preview</label>
+                        <input
+                          type="number"
+                          min={1}
+                          max={100}
+                          step={1}
+                          value={apifyRunLimit}
+                          onChange={(event) => {
+                            const value = Number(event.target.value);
+                            if (Number.isNaN(value)) {
+                              setApifyRunLimit(1);
+                              return;
+                            }
+                            setApifyRunLimit(Math.min(Math.max(Math.round(value), 1), 100));
+                          }}
+                          className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:border-purple-500 focus:outline-none focus:ring-2 focus:ring-purple-200"
+                        />
+                      </div>
+                    </div>
+                    <div className="flex flex-wrap items-center gap-3">
+                      <button
+                        type="button"
+                        onClick={handleFetchApifyRun}
+                        disabled={isFetchingApifyRun || isRunningApifyTest}
+                        className="px-4 py-2 bg-slate-700 hover:bg-slate-800 disabled:bg-slate-500 text-white rounded-lg text-sm font-medium flex items-center gap-2"
+                      >
+                        <FileText className={`h-4 w-4 ${isFetchingApifyRun ? "animate-spin" : ""}`} />
+                        {isFetchingApifyRun ? "Loading run..." : "Fetch Apify run"}
+                      </button>
+                      <p className="text-xs text-gray-500">
+                        Paste an Apify run ID to preview its dataset without triggering a new actor execution.
+                      </p>
+                    </div>
+                  </div>
+
+                  {apifyTestError && (
+                    <div className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
+                      {apifyTestError}
+                    </div>
+                  )}
+
+                  <p className="text-xs text-gray-500">
+                    Runs the configured Apify actor (or loads an existing run) to preview the actor input JSON and normalized posts before importing them into the database.
+                  </p>
+
+                  {apifyTestResult && (
+                    <div className="space-y-4 rounded-lg border border-gray-200 bg-gray-50 p-4">
+                      <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 text-sm text-gray-600">
+                        <div className="flex flex-col">
+                          <span className="font-medium text-gray-700">
+                            Runner: {apifyRunnerLabel ?? apifyTestResult.runner}
+                          </span>
+                          {apifyResultSummary && (
+                            <span className="text-xs text-gray-500">{apifyResultSummary}</span>
+                          )}
+                        </div>
+                        <span>
+                          Raw items: {apifyRawItemCount} • Normalized posts: {apifyPosts.length}
+                        </span>
+                      </div>
+                      {lastLoadedRunId && (
+                        <div className="flex flex-wrap items-center gap-3 text-sm">
+                          <button
+                            type="button"
+                            onClick={handleImportApifyRun}
+                            disabled={isImportingApifyRun || apifyPosts.length === 0}
+                            className="px-4 py-2 bg-green-600 hover:bg-green-700 disabled:bg-green-400 text-white rounded-lg text-sm font-medium flex items-center gap-2"
+                          >
+                            <Download className={`h-4 w-4 ${isImportingApifyRun ? "animate-spin" : ""}`} />
+                            {isImportingApifyRun ? "Importing..." : "Import posts"}
+                          </button>
+                          <span className="text-xs text-gray-500">
+                            Imports posts into the monitor using the above run snapshot.
+                          </span>
+                        </div>
+                      )}
+
+                      {(apifyUsernameInputs.length > 0 || apifyDirectUrls.length > 0) && (
+                        <div className="space-y-2 text-xs text-gray-600">
+                          {apifyUsernameInputs.length > 0 && (
+                            <div>
+                              <p className="font-semibold uppercase tracking-wide text-gray-500">Username inputs</p>
+                              <div className="flex flex-wrap gap-2">
+                                {apifyUsernameInputs.map((value) => (
+                                  <span
+                                    key={value}
+                                    className="rounded-full bg-white px-3 py-1 text-xs text-gray-700 border border-gray-200"
+                                  >
+                                    {value}
+                                  </span>
+                                ))}
+                              </div>
+                            </div>
+                          )}
+                          {apifyDirectUrls.length > 0 && (
+                            <div>
+                              <p className="font-semibold uppercase tracking-wide text-gray-500">Direct URLs</p>
+                              <div className="flex flex-wrap gap-2">
+                                {apifyDirectUrls.map((url) => (
+                                  <a
+                                    key={url}
+                                    href={url}
+                                    target="_blank"
+                                    rel="noopener noreferrer"
+                                    className="rounded-full bg-white px-3 py-1 text-xs text-blue-600 hover:text-blue-800 border border-blue-200"
+                                  >
+                                    {url}
+                                  </a>
+                                ))}
+                              </div>
+                            </div>
+                          )}
+                          {apifyUniqueUsernames.length > 0 && (
+                            <p className="text-xs text-gray-500">
+                              Profiles in results: {apifyUniqueUsernames.map((name) => `@${name}`).join(", ")}
+                            </p>
+                          )}
+                        </div>
+                      )}
+
+                      <div>
+                        <p className="text-xs font-semibold text-gray-600 uppercase tracking-wide mb-2">Actor input</p>
+                        <pre className="max-h-48 overflow-auto rounded-md border border-gray-200 bg-white p-3 text-xs text-gray-800">
+                          {JSON.stringify(apifyTestResult.input, null, 2)}
+                        </pre>
+                      </div>
+
+                      <div>
+                        <p className="text-xs font-semibold text-gray-600 uppercase tracking-wide mb-2">
+                          Normalized posts ({apifyPosts.length})
+                        </p>
+                        {apifyPosts.length > 0 ? (
+                          <div className="space-y-4">
+                            {apifyPosts.map((post, index) => {
+                              const username = post.username ? post.username.replace(/^@/, "") : null;
+                              const profileUrl = username ? `https://www.instagram.com/${username}/` : null;
+                              const permalink = post.permalink ?? (post.id ? `https://www.instagram.com/p/${post.id}/` : null);
+                              return (
+                                <article
+                                  key={`${post.id}-${username ?? 'unknown'}-${index}`}
+                                  className="space-y-3 rounded-md border border-gray-200 bg-white p-3"
+                                >
+                                  {post.image_url && (
+                                    <div className="w-full max-w-sm overflow-hidden rounded-lg border border-gray-200 bg-gray-100">
+                                      <img
+                                        src={post.image_url}
+                                        alt={post.caption ?? "Apify post"}
+                                        className="w-full object-cover"
+                                        onError={(event) => {
+                                          const target = event.currentTarget;
+                                          target.style.display = "none";
+                                        }}
+                                      />
+                                    </div>
+                                  )}
+                                  <div className="flex items-start justify-between gap-3">
+                                    <div className="space-y-1 text-sm text-gray-700">
+                                      {username ? (
+                                        <a
+                                          href={profileUrl!}
+                                          target="_blank"
+                                          rel="noopener noreferrer"
+                                          className="font-semibold text-blue-600 hover:text-blue-800"
+                                        >
+                                          @{username}
+                                        </a>
+                                      ) : (
+                                        <span className="font-semibold text-gray-800">Unknown profile</span>
+                                      )}
+                                      <p className="text-xs text-gray-500">
+                                        Collected: {post.timestamp ? formatTimestamp(post.timestamp) : "—"}
+                                      </p>
+                                    </div>
+                                    <span className="text-xs font-mono text-gray-400">#{post.id}</span>
+                                  </div>
+                                  <p className="whitespace-pre-wrap text-sm text-gray-700">{post.caption || "(no caption)"}</p>
+                                  <div className="flex flex-wrap items-center justify-between gap-3 text-xs text-gray-500">
+                                    <span>Video: {post.is_video ? "Yes" : "No"}</span>
+                                    <div className="flex flex-wrap gap-3">
+                                      {permalink && (
+                                        <a
+                                          href={permalink}
+                                          target="_blank"
+                                          rel="noopener noreferrer"
+                                          className="text-blue-600 hover:text-blue-800"
+                                        >
+                                          View post
+                                        </a>
+                                      )}
+                                      {post.image_url && (
+                                        <a
+                                          href={post.image_url}
+                                          target="_blank"
+                                          rel="noopener noreferrer"
+                                          className="text-blue-600 hover:text-blue-800"
+                                        >
+                                          Open image
+                                        </a>
+                                      )}
+                                    </div>
+                                  </div>
+                                </article>
+                              );
+                            })}
+                          </div>
+                        ) : (
+                          <p className="text-sm text-gray-600">Apify did not return any posts for this run.</p>
+                        )}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              </div>
             </section>
 
             <section className="bg-white rounded-xl shadow-sm p-6 space-y-4">
@@ -1279,121 +1858,122 @@ const App = () => {
         )}
 
         {activeTab === "classify" && (
-          <div className="grid grid-cols-1 xl:grid-cols-2 gap-6">
+          <div className="grid grid-cols-1 xl:grid-cols-[2fr,1fr] gap-6">
             <section className="bg-white rounded-xl shadow-sm p-6">
               <div className="flex items-center justify-between mb-4">
-                <h2 className="text-xl font-semibold">Needs Review</h2>
-                <span className="text-sm text-gray-500">{pendingPosts.length} posts</span>
+                <h2 className="text-xl font-semibold">Review Queue</h2>
+                <span className="text-sm text-gray-500">{reviewQueue.length} posts</span>
               </div>
-              {pendingPosts.length === 0 ? (
+              {reviewQueue.length === 0 ? (
                 <div className="text-center text-gray-500 py-12">
                   <CheckCircle className="mx-auto h-12 w-12 text-gray-300 mb-4" />
                   All caught up—no posts awaiting review.
                 </div>
               ) : (
-                <div className="space-y-4 max-h-[32rem] overflow-y-auto pr-2">
-                  {pendingPosts.map((post) => (
-                    <article key={post.id} className="border border-gray-200 rounded-lg overflow-hidden">
-                      {getImageUrl(post) && (
-                        <div className="bg-gray-100 h-48 flex items-center justify-center">
-                          <img
-                            src={getImageUrl(post)!}
-                            alt={post.caption || 'Instagram post'}
-                            className="w-full h-full object-cover cursor-pointer"
-                            onClick={() => window.open(getImageUrl(post)!, '_blank')}
-                            onError={(e) => {
-                              (e.target as HTMLImageElement).style.display = 'none';
-                              (e.target as HTMLImageElement).parentElement!.innerHTML = '<span class="text-red-500 text-sm">Failed to load image</span>';
-                            }}
-                          />
-                        </div>
-                      )}
-                      <div className="p-4 space-y-3">
-                        <div className="flex items-start justify-between gap-3">
-                          <div>
-                            <a
-                              href={`https://instagram.com/${post.club.username}`}
-                              target="_blank"
-                              rel="noopener noreferrer"
-                              className="font-semibold text-blue-600 hover:text-blue-800 hover:underline"
-                            >
-                              {post.club.name}
-                            </a>
-                            <p className="text-sm text-gray-500">@{post.club.username}</p>
-                            <p className="text-xs text-gray-400 mt-1">{formatTimestamp(post.post_timestamp)}</p>
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4 max-h-[32rem] overflow-y-auto pr-2">
+                  {reviewQueue.map(({ post, source }) => {
+                    const imageUrl = getImageUrl(post);
+                    const badgeLabel = source === "ai"
+                      ? `AI${post.classification_confidence ? ` · ${Math.round(post.classification_confidence * 100)}%` : ""}`
+                      : "Manual";
+                    const badgeClasses = source === "ai"
+                      ? "bg-green-100 text-green-700"
+                      : "bg-slate-200 text-slate-700";
+                    return (
+                      <article key={post.id} className="border border-gray-200 rounded-lg overflow-hidden bg-white flex flex-col">
+                        {imageUrl ? (
+                          <div className="bg-black flex items-center justify-center">
+                            <img
+                              src={imageUrl}
+                              alt={post.caption || 'Instagram post'}
+                              className="w-full max-h-80 object-contain cursor-pointer"
+                              onClick={() => window.open(imageUrl, '_blank')}
+                              onError={(e) => {
+                                (e.target as HTMLImageElement).style.display = 'none';
+                                (e.target as HTMLImageElement).parentElement!.innerHTML = '<span class=\"text-red-500 text-sm py-12\">Failed to load image</span>';
+                              }}
+                            />
                           </div>
-                          <span className="text-xs text-gray-400">#{post.instagram_id}</span>
+                        ) : (
+                          <div className="bg-slate-100 h-32 flex items-center justify-center text-xs text-slate-500">
+                            No image available
+                          </div>
+                        )}
+                        <div className="p-4 space-y-3 flex-1">
+                          <div className="flex items-start justify-between gap-3">
+                            <div>
+                              <a
+                                href={`https://instagram.com/${post.club.username}`}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="font-semibold text-blue-600 hover:text-blue-800 hover:underline"
+                              >
+                                {post.club.name}
+                              </a>
+                              <p className="text-sm text-gray-500">@{post.club.username}</p>
+                              <p className="text-xs text-gray-400 mt-1">{formatTimestamp(post.post_timestamp)}</p>
+                            </div>
+                            <div className="flex flex-col items-end gap-2">
+                              <span className={`text-xs font-semibold rounded-full px-2 py-0.5 ${badgeClasses}`}>
+                                {badgeLabel}
+                              </span>
+                              <span className="text-xs text-gray-400">#{post.instagram_id}</span>
+                            </div>
+                          </div>
+                          <p className="text-sm text-gray-700 whitespace-pre-wrap">{post.caption || "(no caption)"}</p>
+                          {source === "ai" ? (
+                            <div className="flex items-center gap-2">
+                              <button
+                                onClick={() => openEventModal(post)}
+                                className="flex-1 bg-purple-600 hover:bg-purple-700 text-white py-2 rounded-md text-sm font-medium flex items-center justify-center gap-2"
+                              >
+                                <Zap className="h-4 w-4" />
+                                Attach Event JSON
+                              </button>
+                              <button
+                                onClick={() => handleManualClassification(post, false)}
+                                className="flex-1 bg-gray-200 hover:bg-gray-300 text-gray-700 py-2 rounded-md text-sm font-medium"
+                              >
+                                Undo
+                              </button>
+                            </div>
+                          ) : (
+                            <div className="flex items-center gap-2">
+                              <button
+                                onClick={() => handleManualClassification(post, true)}
+                                className="flex-1 bg-purple-600 hover:bg-purple-700 text-white py-2 rounded-md text-sm font-medium flex items-center justify-center gap-2"
+                              >
+                                <CheckCircle className="h-4 w-4" />
+                                Mark Event
+                              </button>
+                              <button
+                                onClick={() => handleManualClassification(post, false)}
+                                className="flex-1 bg-gray-200 hover:bg-gray-300 text-gray-700 py-2 rounded-md text-sm font-medium"
+                              >
+                                Not Event
+                              </button>
+                            </div>
+                          )}
                         </div>
-                        <p className="text-sm text-gray-700 whitespace-pre-wrap">{post.caption || "(no caption)"}</p>
-                        <div className="flex items-center gap-2">
-                        <button
-                          onClick={() => handleManualClassification(post, true)}
-                          className="flex-1 bg-purple-600 hover:bg-purple-700 text-white py-2 rounded-md text-sm font-medium flex items-center justify-center gap-2"
-                        >
-                          <CheckCircle className="h-4 w-4" />
-                          Mark Event
-                        </button>
-                        <button
-                          onClick={() => handleManualClassification(post, false)}
-                          className="flex-1 bg-gray-200 hover:bg-gray-300 text-gray-700 py-2 rounded-md text-sm font-medium"
-                        >
-                          Not Event
-                        </button>
-                        </div>
-                      </div>
-                    </article>
-                  ))}
+                      </article>
+                    );
+                  })}
                 </div>
               )}
             </section>
 
-            <section className="bg-white rounded-xl shadow-sm p-6">
-              <div className="flex items-center justify-between mb-4">
-                <h2 className="text-xl font-semibold">AI Suggestions</h2>
-                <span className="text-sm text-gray-500">{eventPosts.length} detected events</span>
+            <section className="bg-white rounded-xl shadow-sm p-6 space-y-3">
+              <h2 className="text-xl font-semibold">Review Summary</h2>
+              <div className="space-y-2 text-sm text-gray-600">
+                <p>Manual posts waiting: {reviewQueue.filter((item) => item.source === "manual").length}</p>
+                <p>AI suggestions: {reviewQueue.filter((item) => item.source === "ai").length}</p>
+                <p>Rejected posts: {posts.filter((post) => post.is_event_poster === false).length}</p>
+                <p>Ready for extraction: {eventPosts.length}</p>
               </div>
-              <div className="space-y-4 max-h-[32rem] overflow-y-auto pr-2">
-                {eventPosts.map((post) => (
-                  <article key={post.id} className="border border-gray-200 rounded-lg p-4 space-y-3">
-                    <div className="flex items-start justify-between gap-3">
-                      <div>
-                        <a
-                          href={`https://instagram.com/${post.club.username}`}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          className="font-semibold text-blue-600 hover:text-blue-800 hover:underline"
-                        >
-                          {post.club.name}
-                        </a>
-                        <p className="text-sm text-gray-500">@{post.club.username}</p>
-                        <p className="text-xs text-gray-400 mt-1">{formatTimestamp(post.post_timestamp)}</p>
-                      </div>
-                      <span className="text-xs bg-green-100 text-green-700 rounded-full px-2 py-1 font-semibold">
-                        {post.classification_confidence ? `${Math.round(post.classification_confidence * 100)}%` : "AI"}
-                      </span>
-                    </div>
-                    <p className="text-sm text-gray-700 whitespace-pre-wrap">{post.caption || "(no caption)"}</p>
-                    <div className="flex items-center gap-2">
-                      <button
-                        onClick={() => openEventModal(post)}
-                        className="flex-1 bg-purple-600 hover:bg-purple-700 text-white py-2 rounded-md text-sm font-medium flex items-center justify-center gap-2"
-                      >
-                        <Zap className="h-4 w-4" />
-                        Attach Event JSON
-                      </button>
-                      <button
-                        onClick={() => handleManualClassification(post, false)}
-                        className="px-4 py-2 text-sm text-gray-500 hover:text-red-500"
-                      >
-                        Undo
-                      </button>
-                    </div>
-                  </article>
-                ))}
-                {eventPosts.length === 0 && (
-                  <p className="text-sm text-gray-500">No AI-confirmed events yet.</p>
-                )}
-              </div>
+              <p className="text-xs text-gray-500">
+                AI suggestions stay in this queue until you attach event JSON or undo them. Manual posts disappear once
+                you classify them.
+              </p>
             </section>
           </div>
         )}
@@ -1443,13 +2023,23 @@ const App = () => {
                       <p>Collected: {formatTimestamp(post.collected_at)}</p>
                       <p>Post time: {formatTimestamp(post.post_timestamp)}</p>
                     </div>
-                    <button
-                      onClick={() => openEventModal(post)}
-                      className="w-full bg-purple-600 hover:bg-purple-700 text-white py-2 rounded-md text-sm font-medium flex items-center justify-center gap-2"
-                    >
-                      <Download className="h-4 w-4" />
-                      {post.extracted_event ? "Edit Event JSON" : "Add Event JSON"}
-                    </button>
+                    <div className="flex flex-col gap-2">
+                      <button
+                        onClick={() => openEventModal(post)}
+                        className="w-full bg-purple-600 hover:bg-purple-700 text-white py-2 rounded-md text-sm font-medium flex items-center justify-center gap-2"
+                      >
+                        <Zap className="h-4 w-4" />
+                        {post.extracted_event ? "Edit Event JSON" : "Add Event JSON"}
+                      </button>
+                      <button
+                        onClick={() => handleDeletePost(post)}
+                        disabled={deletingPostId === post.id}
+                        className="w-full bg-red-50 hover:bg-red-100 text-red-600 py-2 rounded-md text-sm font-medium flex items-center justify-center gap-2 disabled:opacity-60"
+                      >
+                        <Trash2 className={`h-4 w-4 ${deletingPostId === post.id ? "animate-spin" : ""}`} />
+                        {deletingPostId === post.id ? "Deleting..." : "Delete post"}
+                      </button>
+                    </div>
                   </div>
                 </article>
               ))}

@@ -50,6 +50,22 @@ frontend/
    ```
    The service listens on `http://localhost:8000` by default.
 
+### Apify Node Runner (recommended)
+If you rely on Apify for scraping, install the bundled Node.js helper that calls Actors via the official `apify-client` library. It delivers better reliability than the bare REST fallback.
+
+1. Ensure Node.js 18 or newer is available on the host.
+2. Install the runner dependencies once:
+   ```bash
+   cd backend/app/utils/apify_node_runner
+   npm install
+   ```
+3. Start the backend with the environment variable `APIFY_USE_NODE_CLIENT=1` (or leave it unset—the runner is picked automatically when the dependencies are present). Optional environment knobs:
+   - `APIFY_NODE_COMMAND` – override the Node binary (`node` by default).
+   - `APIFY_NODE_RUNNER_PATH` – point to a custom runner script.
+   - `APIFY_NODE_TIMEOUT_BUFFER_SECONDS` – extra seconds to allow the runner to flush output after an actor finishes (default `30`).
+
+If the runner or Node is missing, the backend transparently falls back to the existing REST polling client.
+
 ### Key API Endpoints
 - `POST /monitor/start` / `POST /monitor/stop` – toggle background scraping.
 - `GET /monitor/status` – check last/next run times.
