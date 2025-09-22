@@ -5,7 +5,7 @@ services:
       dockerfile: backend/Dockerfile
     container_name: event-monitor-backend
     ports:
-      - "8000:8000"
+      - "${BACKEND_PORT:-8000}:8000"
     volumes:
       - event-monitor-db:/app/instagram_monitor.db
       - event-monitor-images:/app/app/static/images
@@ -24,7 +24,7 @@ services:
     depends_on:
       - backend
     ports:
-      - "3000:80"
+      - "${FRONTEND_PORT:-3000}:80"
     restart: unless-stopped
 
 volumes:

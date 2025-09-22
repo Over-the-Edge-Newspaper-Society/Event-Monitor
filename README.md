@@ -129,6 +129,18 @@ Spin up the React dashboard and FastAPI backend together with Docker Compose (ha
    ```
    Open firewall ports `3000` (dashboard) and optionally `8000` (direct API) so other computers on your network can connect. If the dashboard sits behind a reverse proxy, set the `VITE_API_BASE` build arg in `docker-compose.yml` to the public `/api` path the proxy exposes.
 
+   The exposed host ports are configurable via environment variables:
+   - `FRONTEND_PORT` (default `3000`) → forwards to the Nginx container on port 80.
+   - `BACKEND_PORT` (default `8000`) → forwards to the FastAPI container on port 8000.
+
+   With Komodo you can declare these in your stack TOML (or an `.env` file) before bringing the stack up, e.g.
+   ```toml
+   [env]
+   FRONTEND_PORT = "3100"
+   BACKEND_PORT = "8100"
+   ```
+   Then run `docker compose up -d --build` and the dashboard will be reachable at `http://<host>:3100`.
+
 ### Instagram Login & Rate Limits
 - Generate a session file on your desktop: `instaloader -l YOUR_USERNAME` (the command will create `YOUR_USERNAME.session` once you authenticate and complete 2FA).
 - Open the app’s **Setup → Instagram Login** card, enter the same username, and upload the `.session` file so Instaloader uses the authenticated cookies.
