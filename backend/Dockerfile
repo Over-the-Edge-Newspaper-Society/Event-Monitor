@@ -9,6 +9,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libffi-dev \
     libssl-dev \
     curl \
+    nodejs \
+    npm \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Python dependencies
@@ -18,8 +20,14 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application code
 COPY backend /app
 
-# Ensure static and data directories exist
-RUN mkdir -p app/static/images
+# Install Node dependencies for Apify runner
+RUN npm --prefix app/utils/apify_node_runner install --omit=dev
+
+# Ensure static and data directories exist and are writable
+RUN mkdir -p /data app/static/images app/instaloader_session \
+    && chown -R www-data:www-data /app /data
+
+USER www-data
 
 ENV PYTHONPATH=/app
 EXPOSE 8000

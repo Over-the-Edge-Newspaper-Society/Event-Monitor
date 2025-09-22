@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from datetime import datetime
 from typing import Optional
 
@@ -134,6 +135,7 @@ def ensure_default_settings(session) -> SystemSetting:
             conn.commit()
 
     setting: Optional[SystemSetting] = session.query(SystemSetting).order_by(SystemSetting.id).first()
+    updated = False
     if setting is None:
         setting = SystemSetting(
             monitoring_enabled=False,
@@ -146,7 +148,6 @@ def ensure_default_settings(session) -> SystemSetting:
         session.commit()
         session.refresh(setting)
     else:
-        updated = False
         if setting.monitor_interval_minutes is None:
             setting.monitor_interval_minutes = 45
             updated = True
@@ -173,6 +174,41 @@ def ensure_default_settings(session) -> SystemSetting:
             updated = True
         if getattr(setting, "gemini_auto_extract", None) is None:
             setting.gemini_auto_extract = False
+            updated = True
+
+    env_actor_id = os.getenv("APIFY_ACTOR_ID")
+    if env_actor_id and setting.apify_actor_id != env_actor_id:
+        setting.apify_actor_id = env_actor_id
+        updated = True
+
+    env_token = os.getenv("APIFY_API_TOKEN")
+    if env_token and setting.apify_api_token != env_token:
+        setting.apify_api_token = env_token
+        updated = True
+
+    env_enabled = os.getenv("APIFY_ENABLED")
+    if env_enabled is not None:
+        normalized = env_enabled.strip().lower()
+        desired = normalized in {"1", "true", "yes", "on"}
+        if bool(setting.apify_enabled) != desired:
+            setting.apify_enabled = desired
+            updated = True
+
+    env_limit = os.getenv("APIFY_RESULTS_LIMIT")
+    if env_limit:
+        try:
+            parsed_limit = max(1, min(int(env_limit), 1000))
+        except ValueError:
+            parsed_limit = None
+        if parsed_limit is not None and setting.apify_results_limit != parsed_limit:
+            setting.apify_results_limit = parsed_limit
+            updated = True
+
+    env_fetcher = os.getenv("APIFY_FETCHER_MODE")
+    if env_fetcher:
+        normalized_fetcher = env_fetcher.strip().lower()
+        if normalized_fetcher in {"auto", "instaloader", "apify"} and setting.instagram_fetcher != normalized_fetcher:
+            setting.instagram_fetcher = normalized_fetcher
             updated = True
     if updated:
         session.commit()

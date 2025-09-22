@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
@@ -7,7 +8,9 @@ from typing import Iterator
 from sqlalchemy import create_engine
 from sqlalchemy.orm import declarative_base, sessionmaker
 
-DB_PATH = Path(__file__).resolve().parent.parent / "instagram_monitor.db"
+default_db_path = Path(__file__).resolve().parent.parent / "instagram_monitor.db"
+DB_PATH = Path(os.getenv("DATABASE_PATH", default_db_path))
+DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 SQLALCHEMY_DATABASE_URL = f"sqlite:///{DB_PATH}"
 
 engine = create_engine(

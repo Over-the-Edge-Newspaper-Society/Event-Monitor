@@ -7,11 +7,17 @@ services:
     ports:
       - "${BACKEND_PORT:-8000}:8000"
     volumes:
-      - event-monitor-db:/app/instagram_monitor.db
+      - event-monitor-db:/data
       - event-monitor-images:/app/app/static/images
       - event-monitor-session:/app/app/instaloader_session
     environment:
       - PYTHONPATH=/app
+      - DATABASE_PATH=/data/instagram_monitor.db
+      - APIFY_API_TOKEN=${APIFY_API_TOKEN:-}
+      - APIFY_ENABLED=${APIFY_ENABLED:-}
+      - APIFY_RESULTS_LIMIT=${APIFY_RESULTS_LIMIT:-}
+      - APIFY_FETCHER_MODE=${APIFY_FETCHER_MODE:-}
+      - APIFY_ACTOR_ID=${APIFY_ACTOR_ID:-}
     restart: unless-stopped
 
   frontend:

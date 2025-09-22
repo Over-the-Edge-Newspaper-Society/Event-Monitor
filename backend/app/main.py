@@ -3,17 +3,20 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import os
+import shutil
+import tempfile
+import zipfile
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Set
 
 from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy.orm import Session, joinedload
 
-from .database import SessionLocal, engine
+from .database import DB_PATH, SessionLocal, engine
 from .models import (
     Base,
     Club,
@@ -72,6 +75,8 @@ app.mount("/static", StaticFiles(directory="app/static"), name="static")
 INSTALOADER_SESSION_DIR = Path("app/instaloader_session")
 INSTALOADER_SESSION_DIR.mkdir(parents=True, exist_ok=True)
 INSTALOADER_SESSION_PATH = INSTALOADER_SESSION_DIR / "instaloader.session"
+IMAGES_DIR = Path("app/static/images")
+IMAGES_DIR.mkdir(parents=True, exist_ok=True)
 
 
 async def get_db():
@@ -110,6 +115,105 @@ async def on_shutdown() -> None:
 @app.get("/health")
 async def health_check() -> dict:
     return {"status": "ok"}
+
+
+def _cleanup_file(path: Path) -> None:
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+@app.get("/export/full", response_class=FileResponse)
+async def export_full_backup(background_tasks: BackgroundTasks) -> FileResponse:
+    timestamp = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
+    backup_path = Path(tmp.name)
+    tmp.close()
+
+    try:
+        with zipfile.ZipFile(backup_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            if DB_PATH.exists():
+                archive.write(DB_PATH, arcname="instagram_monitor.db")
+            if IMAGES_DIR.exists():
+                for file_path in IMAGES_DIR.rglob("*"):
+                    if file_path.is_file():
+                        archive.write(
+                            file_path,
+                            arcname=f"static/images/{file_path.relative_to(IMAGES_DIR)}",
+                        )
+    except Exception:
+        backup_path.unlink(missing_ok=True)
+        raise
+
+    background_tasks.add_task(_cleanup_file, backup_path)
+    return FileResponse(
+        backup_path,
+        media_type="application/zip",
+        filename=f"event-monitor-backup-{timestamp}.zip",
+        background=background_tasks,
+    )
+
+
+def _validate_zip_entry(name: str) -> None:
+    path = Path(name)
+    if path.is_absolute() or ".." in path.parts:
+        raise HTTPException(status_code=400, detail="Archive contains unsafe paths")
+
+
+@app.post("/import/full")
+async def import_full_backup(file: UploadFile = File(...)) -> Dict[str, str]:
+    if not file.filename.lower().endswith(".zip"):
+        raise HTTPException(status_code=400, detail="Upload a .zip archive")
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".zip") as tmp:
+        try:
+            shutil.copyfileobj(file.file, tmp)
+        finally:
+            file.file.close()
+        temp_zip_path = Path(tmp.name)
+
+    try:
+        with zipfile.ZipFile(temp_zip_path, "r") as archive:
+            if "instagram_monitor.db" not in archive.namelist():
+                raise HTTPException(status_code=400, detail="Archive missing instagram_monitor.db")
+            for info in archive.infolist():
+                _validate_zip_entry(info.filename)
+
+            with tempfile.TemporaryDirectory() as extract_dir:
+                archive.extractall(path=extract_dir)
+                extract_path = Path(extract_dir)
+                new_db_path = extract_path / "instagram_monitor.db"
+                if not new_db_path.exists():
+                    raise HTTPException(status_code=400, detail="Archive missing instagram_monitor.db")
+                new_images_dir = extract_path / "static" / "images"
+
+                engine.dispose()
+
+                DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(new_db_path, DB_PATH)
+
+                if IMAGES_DIR.exists():
+                    shutil.rmtree(IMAGES_DIR)
+                if new_images_dir.exists():
+                    shutil.copytree(new_images_dir, IMAGES_DIR)
+                else:
+                    IMAGES_DIR.mkdir(parents=True, exist_ok=True)
+
+    except zipfile.BadZipFile as exc:
+        raise HTTPException(status_code=400, detail="Uploaded file is not a valid zip archive") from exc
+    finally:
+        temp_zip_path.unlink(missing_ok=True)
+
+    session = SessionLocal()
+    try:
+        settings = ensure_default_settings(session)
+        monitor_service.configure_from_settings(settings)
+        monitor_service.clear_last_error()
+    finally:
+        session.close()
+
+    return {"message": "Backup imported successfully."}
 
 
 @app.get("/monitor/status", response_model=MonitorStatus)

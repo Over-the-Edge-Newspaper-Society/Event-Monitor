@@ -1,4 +1,4 @@
-import { ChangeEvent } from "react";
+import { ChangeEvent, useRef } from "react";
 import { Database, Sparkles, Upload, RefreshCcw, Settings } from "lucide-react";
 
 import type { Club, FetcherMode, StatsSnapshot, SystemSettings } from "../types";
@@ -30,6 +30,8 @@ interface SetupSectionProps {
   isSavingGeminiKey: boolean;
   isClearingGeminiKey: boolean;
   isSavingGeminiSettings: boolean;
+  isDownloadingBackup: boolean;
+  isRestoringBackup: boolean;
   isUpdatingWorkflow: boolean;
   sessionFileKey: string;
   onCSVUpload: (event: ChangeEvent<HTMLInputElement>) => VoidOrPromise;
@@ -56,6 +58,9 @@ interface SetupSectionProps {
   onGeminiAutoExtractChange: (value: boolean) => void;
   onSaveGeminiSettings: () => VoidOrPromise;
   onToggleWorkflowMode: () => VoidOrPromise;
+  onDownloadBackup: () => VoidOrPromise;
+  onRestoreBackup: (file: File) => VoidOrPromise;
+  backupFileInputKey: string;
 }
 
 export const SetupSection = ({
@@ -81,6 +86,8 @@ export const SetupSection = ({
   isSavingGeminiKey,
   isClearingGeminiKey,
   isSavingGeminiSettings,
+  isDownloadingBackup,
+  isRestoringBackup,
   isUpdatingWorkflow,
   sessionFileKey,
   onCSVUpload,
@@ -107,8 +114,136 @@ export const SetupSection = ({
   onGeminiAutoExtractChange,
   onSaveGeminiSettings,
   onToggleWorkflowMode,
+  onDownloadBackup,
+  onRestoreBackup,
+  backupFileInputKey,
 }: SetupSectionProps) => (
-  <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+  <SetupSectionContent
+    clubs={clubs}
+    stats={stats}
+    systemSettings={systemSettings}
+    sessionUsernameInput={sessionUsernameInput}
+    sessionCookieInput={sessionCookieInput}
+    clubDelayInput={clubDelayInput}
+    apifyEnabledInput={apifyEnabledInput}
+    apifyResultsLimitInput={apifyResultsLimitInput}
+    apifyTokenInput={apifyTokenInput}
+    geminiApiKeyInput={geminiApiKeyInput}
+    geminiAutoExtractEnabled={geminiAutoExtractEnabled}
+    apifyFetcherMode={apifyFetcherMode}
+    fetchingClubId={fetchingClubId}
+    isUploadingSession={isUploadingSession}
+    isRemovingSession={isRemovingSession}
+    isSavingDelay={isSavingDelay}
+    isSavingApifySettings={isSavingApifySettings}
+    isSavingApifyToken={isSavingApifyToken}
+    isClearingApifyToken={isClearingApifyToken}
+    isSavingGeminiKey={isSavingGeminiKey}
+    isClearingGeminiKey={isClearingGeminiKey}
+    isSavingGeminiSettings={isSavingGeminiSettings}
+    isDownloadingBackup={isDownloadingBackup}
+    isRestoringBackup={isRestoringBackup}
+    isUpdatingWorkflow={isUpdatingWorkflow}
+    sessionFileKey={sessionFileKey}
+    onCSVUpload={onCSVUpload}
+    onToggleActive={onToggleActive}
+    onToggleMode={onToggleMode}
+    onFetchLatestForClub={onFetchLatestForClub}
+    onSessionUsernameChange={onSessionUsernameChange}
+    onSessionFileChange={onSessionFileChange}
+    onRemoveSession={onRemoveSession}
+    onSessionCookieChange={onSessionCookieChange}
+    onUploadSessionCookie={onUploadSessionCookie}
+    onClubDelayChange={onClubDelayChange}
+    onSaveDelay={onSaveDelay}
+    onFetcherModeChange={onFetcherModeChange}
+    onApifyEnabledChange={onApifyEnabledChange}
+    onApifyResultsLimitChange={onApifyResultsLimitChange}
+    onSaveApifySettings={onSaveApifySettings}
+    onApifyTokenChange={onApifyTokenChange}
+    onSaveApifyToken={onSaveApifyToken}
+    onClearApifyToken={onClearApifyToken}
+    onGeminiKeyChange={onGeminiKeyChange}
+    onSaveGeminiKey={onSaveGeminiKey}
+    onClearGeminiKey={onClearGeminiKey}
+    onGeminiAutoExtractChange={onGeminiAutoExtractChange}
+    onSaveGeminiSettings={onSaveGeminiSettings}
+    onToggleWorkflowMode={onToggleWorkflowMode}
+    onDownloadBackup={onDownloadBackup}
+    onRestoreBackup={onRestoreBackup}
+    backupFileInputKey={backupFileInputKey}
+  />
+);
+
+type SetupSectionContentProps = SetupSectionProps;
+
+const SetupSectionContent = ({
+  clubs,
+  stats,
+  systemSettings,
+  sessionUsernameInput,
+  sessionCookieInput,
+  clubDelayInput,
+  apifyEnabledInput,
+  apifyResultsLimitInput,
+  apifyTokenInput,
+  geminiApiKeyInput,
+  geminiAutoExtractEnabled,
+  apifyFetcherMode,
+  fetchingClubId,
+  isUploadingSession,
+  isRemovingSession,
+  isSavingDelay,
+  isSavingApifySettings,
+  isSavingApifyToken,
+  isClearingApifyToken,
+  isSavingGeminiKey,
+  isClearingGeminiKey,
+  isSavingGeminiSettings,
+  isDownloadingBackup,
+  isRestoringBackup,
+  isUpdatingWorkflow,
+  sessionFileKey,
+  onCSVUpload,
+  onToggleActive,
+  onToggleMode,
+  onFetchLatestForClub,
+  onSessionUsernameChange,
+  onSessionFileChange,
+  onRemoveSession,
+  onSessionCookieChange,
+  onUploadSessionCookie,
+  onClubDelayChange,
+  onSaveDelay,
+  onFetcherModeChange,
+  onApifyEnabledChange,
+  onApifyResultsLimitChange,
+  onSaveApifySettings,
+  onApifyTokenChange,
+  onSaveApifyToken,
+  onClearApifyToken,
+  onGeminiKeyChange,
+  onSaveGeminiKey,
+  onClearGeminiKey,
+  onGeminiAutoExtractChange,
+  onSaveGeminiSettings,
+  onToggleWorkflowMode,
+  onDownloadBackup,
+  onRestoreBackup,
+  backupFileInputKey,
+}: SetupSectionContentProps) => {
+  const backupInputRef = useRef<HTMLInputElement | null>(null);
+
+  const handleBackupFileChange = (event: ChangeEvent<HTMLInputElement>) => {
+    const selected = event.target.files?.[0];
+    if (selected) {
+      onRestoreBackup(selected);
+    }
+    event.target.value = "";
+  };
+
+  return (
+    <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
     <section className="bg-white rounded-xl shadow-sm p-6 space-y-4">
       <h2 className="text-xl font-semibold">Load Clubs CSV</h2>
       <p className="text-sm text-gray-600">
@@ -475,5 +610,46 @@ export const SetupSection = ({
         </div>
       </div>
     </section>
+
+    <section className="bg-white rounded-xl shadow-sm p-6 space-y-4">
+      <div className="flex items-center justify-between">
+        <h2 className="text-xl font-semibold flex items-center gap-2">
+          <Settings className="h-5 w-5 text-purple-600" />
+          Backup & Transfer
+        </h2>
+      </div>
+      <p className="text-sm text-gray-600">
+        Download a portable archive containing the SQLite database and cached Instagram images, or restore one to
+        migrate the monitor to another machine.
+      </p>
+      <div className="flex flex-wrap items-center gap-3">
+        <button
+          onClick={onDownloadBackup}
+          disabled={isDownloadingBackup}
+          className="px-4 py-2 rounded-lg bg-purple-600 hover:bg-purple-700 text-white text-sm font-medium disabled:bg-purple-400"
+        >
+          {isDownloadingBackup ? "Preparing archive..." : "Download backup zip"}
+        </button>
+        <button
+          onClick={() => backupInputRef.current?.click()}
+          disabled={isRestoringBackup}
+          className="px-4 py-2 rounded-lg border border-purple-200 text-sm font-medium text-purple-700 hover:bg-purple-50 disabled:border-gray-200 disabled:text-gray-400"
+        >
+          {isRestoringBackup ? "Restoring..." : "Restore from backup zip"}
+        </button>
+        <input
+          key={backupFileInputKey}
+          ref={backupInputRef}
+          type="file"
+          accept=".zip"
+          className="hidden"
+          onChange={handleBackupFileChange}
+        />
+        <span className="text-xs text-gray-500">
+          Includes `instagram_monitor.db` and all files under `static/images/`.
+        </span>
+      </div>
+    </section>
   </div>
 );
+};

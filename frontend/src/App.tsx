@@ -63,6 +63,9 @@ const App = () => {
   const [isClearingGeminiKey, setIsClearingGeminiKey] = useState(false);
   const [geminiAutoExtractEnabled, setGeminiAutoExtractEnabled] = useState(false);
   const [isSavingGeminiSettings, setIsSavingGeminiSettings] = useState(false);
+  const [isDownloadingBackup, setIsDownloadingBackup] = useState(false);
+  const [isRestoringBackup, setIsRestoringBackup] = useState(false);
+  const [backupFileInputKey, setBackupFileInputKey] = useState(() => Date.now().toString());
   const [apifyFetcherMode, setApifyFetcherMode] = useState<FetcherMode>("auto");
   const [apifyTestUrl, setApifyTestUrl] = useState("https://www.instagram.com/humansofny/");
   const [apifyTestLimit, setApifyTestLimit] = useState<number>(1);
@@ -561,6 +564,68 @@ const App = () => {
       handleApiError((err as Error).message);
     } finally {
       setIsExportingEvents(false);
+    }
+  };
+
+  const handleDownloadBackup = async () => {
+    try {
+      setIsDownloadingBackup(true);
+      const response = await fetch(`${API_BASE}/export/full`);
+      if (!response.ok) {
+        const text = await response.text();
+        throw new Error(text || "Failed to prepare backup archive");
+      }
+      const blob = await response.blob();
+      const contentDisposition = response.headers.get("Content-Disposition");
+      let filename = "event-monitor-backup.zip";
+      if (contentDisposition) {
+        const match = /filename\*=UTF-8''([^;]+)|filename="?([^";]+)"?/i.exec(contentDisposition);
+        const rawName = match?.[1] ?? match?.[2];
+        if (rawName) {
+          try {
+            filename = decodeURIComponent(rawName);
+          } catch {
+            filename = rawName;
+          }
+        }
+      }
+
+      const url = window.URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = filename;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      window.URL.revokeObjectURL(url);
+      showSuccess("Backup archive downloaded.");
+    } catch (err) {
+      handleApiError((err as Error).message);
+    } finally {
+      setIsDownloadingBackup(false);
+    }
+  };
+
+  const handleRestoreBackup = async (file: File) => {
+    try {
+      setIsRestoringBackup(true);
+      const form = new FormData();
+      form.append("file", file);
+      const response = await fetch(`${API_BASE}/import/full`, {
+        method: "POST",
+        body: form,
+      });
+      if (!response.ok) {
+        const text = await response.text();
+        throw new Error(text || "Failed to import backup archive");
+      }
+      await refreshAll();
+      showSuccess("Backup restored. Data refreshed.");
+    } catch (err) {
+      handleApiError((err as Error).message);
+    } finally {
+      setIsRestoringBackup(false);
+      setBackupFileInputKey(Date.now().toString());
     }
   };
 
@@ -1063,6 +1128,8 @@ const App = () => {
     isSavingGeminiKey,
     isClearingGeminiKey,
     isSavingGeminiSettings,
+    isDownloadingBackup,
+    isRestoringBackup,
     isUpdatingWorkflow,
     sessionFileKey,
     onCSVUpload: handleCSVUpload,
@@ -1089,6 +1156,9 @@ const App = () => {
     onGeminiAutoExtractChange: setGeminiAutoExtractEnabled,
     onSaveGeminiSettings: handleSaveGeminiSettings,
     onToggleWorkflowMode: handleToggleWorkflowMode,
+    onDownloadBackup: handleDownloadBackup,
+    onRestoreBackup: handleRestoreBackup,
+    backupFileInputKey,
   } as const;
 
   const monitorSectionProps = {

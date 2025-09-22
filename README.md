@@ -10,6 +10,7 @@ End-to-end prototype for continuously scraping Instagram club accounts, classify
 - **REST API** (FastAPI) for monitor control, classification queue, and event storage.
 - **React dashboard** (Vite + Tailwind) mirroring the architecture mock-ups for CSV import, monitoring controls, manual review, and event JSON management.
 - **Gemini-powered extraction** that turns approved posters into structured event JSON with a single click once an API key is configured.
+- **One-click backup export** that bundles the SQLite database and cached Instagram images into a zip for migrations or archival.
 
 ## Repository Layout
 ```
@@ -94,6 +95,11 @@ The monitoring loop respects the `monitoring_enabled` flag (default `false`). Au
 - Each club is returned once with `clubName`, profile URL, and an `events` array containing the original extractor payload plus metadata like Instagram post URL, caption, and a stable DB identifier.
 - Ideal for feeding downstream pipelines without touching the original prompt results; your workflow can merge the wrapper metadata with other systems on import.
 
+### Full Backup Import/Export
+- Call `GET /export/full` (or the new “Download backup zip” button on the Setup tab) to generate an archive containing `instagram_monitor.db` and every file under `static/images/`.
+- Restore by uploading the archive through the dashboard or sending the file to `POST /import/full`; the backend replaces the SQLite database and cached images, then reapplies schema defaults.
+- The endpoint streams/consumes data on the server, so backups work the same in Docker or local development.
+
 ## Frontend Setup
 1. Install dependencies and start the Vite dev server:
    ```bash
@@ -119,7 +125,7 @@ Spin up the React dashboard and FastAPI backend together with Docker Compose (ha
    The frontend is served on `http://localhost:3000` and proxies API calls to the backend container. Expose the same ports (or adjust them) on Komodo or any other remote host so teammates can reach the dashboard from their machines.
 2. Access the API directly at `http://localhost:8000` if needed, or via the frontend's `/api/*` proxy.
 3. Named Docker volumes keep state between restarts and deployments:
-   - `event-monitor-db` → `/app/instagram_monitor.db` (SQLite database)
+   - `event-monitor-db` → `/data` (contains `instagram_monitor.db`)
    - `event-monitor-images` → `/app/app/static/images` (downloaded Instagram images)
    - `event-monitor-session` → `/app/app/instaloader_session` (Instagram session cookies)
    On a fresh host, Docker creates these volumes automatically; snapshot or migrate them as needed for backups.
@@ -132,12 +138,20 @@ Spin up the React dashboard and FastAPI backend together with Docker Compose (ha
    The exposed host ports are configurable via environment variables:
    - `FRONTEND_PORT` (default `3000`) → forwards to the Nginx container on port 80.
    - `BACKEND_PORT` (default `8000`) → forwards to the FastAPI container on port 8000.
+   - `DATABASE_PATH` (optional; defaults to `/data/instagram_monitor.db` when running via Compose) if you need to point the backend at a different SQLite location.
+   - `APIFY_API_TOKEN` – seed the backend with your Apify personal token so the UI shows “Has token” on first launch.
+   - `APIFY_ENABLED` – set to `true` to turn on the Apify fallback automatically (`false` leaves it disabled).
+   - `APIFY_RESULTS_LIMIT` – override the per-run fetch limit (1–1000; defaults to 30).
+   - `APIFY_FETCHER_MODE` – force the fetcher to `auto`, `instaloader`, or `apify` at startup.
+   - `APIFY_ACTOR_ID` – point to a custom Apify actor instead of the baked-in default.
 
    With Komodo you can declare these in your stack TOML (or an `.env` file) before bringing the stack up, e.g.
    ```toml
    [env]
    FRONTEND_PORT = "3100"
    BACKEND_PORT = "8100"
+   APIFY_API_TOKEN = "${your_apify_token}"
+   APIFY_ENABLED = "true"
    ```
    Then run `docker compose up -d --build` and the dashboard will be reachable at `http://<host>:3100`.
 
