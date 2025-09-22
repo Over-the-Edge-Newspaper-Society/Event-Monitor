@@ -85,6 +85,7 @@ The monitoring loop respects the `monitoring_enabled` flag (default `false`). Au
 - Optionally override the model with `GEMINI_MODEL_ID` (defaults to `gemini-2.5-flash`).
 - The Events tab exposes an “Extract with Gemini” button that calls `POST /posts/{id}/extract` and automatically stores the structured JSON payload under the matching post.
 - You can re-run extraction at any time; existing JSON is overwritten unless `overwrite=false` is supplied on the endpoint.
+- Enable the “auto extract” toggle on the Gemini card to process newly detected/approved event posts automatically (falls back to manual review if the call fails).
 
 ## Frontend Setup
 1. Install dependencies and start the Vite dev server:

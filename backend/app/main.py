@@ -46,6 +46,7 @@ from .services.gemini_extractor import (
     GeminiApiKeyMissing,
     GeminiClientUnavailable,
     GeminiExtractionError,
+    auto_extract_for_post,
     extract_event_data_for_post,
 )
 from .services.monitor import monitor_service, RateLimitError, ApifyIntegrationError
@@ -172,6 +173,9 @@ async def update_system_settings(
         if fetcher not in {"auto", "instaloader", "apify"}:
             raise HTTPException(status_code=400, detail="Invalid Instagram fetcher selection")
         settings.instagram_fetcher = fetcher
+        updated = True
+    if payload.gemini_auto_extract is not None:
+        settings.gemini_auto_extract = bool(payload.gemini_auto_extract)
         updated = True
     if updated:
         db.commit()
@@ -592,7 +596,7 @@ async def fetch_latest_posts_stream(post_count: int = 3, db: Session = Depends(g
 
                 for post in posts:
                     auto_classify = global_auto and (club.classification_mode or ClassificationModeEnum.MANUAL).lower() == ClassificationModeEnum.AUTO
-                    if monitor_service._create_post_if_new(db, club, post, auto_classify):
+                    if monitor_service._create_post_if_new(db, club, post, auto_classify, settings):
                         stats["posts"] += 1
                         if auto_classify:
                             stats["classified"] += 1
@@ -669,9 +673,16 @@ async def classify_post(
     post = db.query(Post).options(joinedload(Post.club)).filter(Post.id == post_id).one_or_none()
     if not post:
         raise HTTPException(status_code=404, detail="Post not found")
+    settings = ensure_default_settings(db)
     post.is_event_poster = payload.is_event_poster
     post.classification_confidence = payload.confidence
     post.manual_review_notes = payload.notes
+
+    if payload.is_event_poster:
+        try:
+            auto_extract_for_post(post, settings, overwrite=False)
+        except Exception as exc:  # pragma: no cover - safeguard against unexpected errors
+            print(f"Gemini auto extraction failed during manual classification for post {post.instagram_id}: {exc}")
     db.commit()
     db.refresh(post)
     return post
@@ -841,6 +852,7 @@ def _system_settings_out(settings) -> SystemSettingsOut:
         apify_results_limit=settings.apify_results_limit,
         has_apify_token=bool(getattr(settings, "apify_api_token", None)),
         has_gemini_api_key=bool((settings.gemini_api_key or "").strip() or os.getenv("GEMINI_API_KEY")),
+        gemini_auto_extract=bool(getattr(settings, "gemini_auto_extract", False)),
         instagram_fetcher=(settings.instagram_fetcher or "auto"),
         created_at=_iso(settings.created_at),
         updated_at=_iso(settings.updated_at),

@@ -96,6 +96,7 @@ interface SystemSettings {
   apify_results_limit: number;
   has_apify_token: boolean;
   has_gemini_api_key: boolean;
+  gemini_auto_extract: boolean;
   instagram_fetcher: FetcherMode;
   created_at: string;
   updated_at: string;
@@ -201,6 +202,8 @@ const App = () => {
   const [geminiApiKeyInput, setGeminiApiKeyInput] = useState("");
   const [isSavingGeminiKey, setIsSavingGeminiKey] = useState(false);
   const [isClearingGeminiKey, setIsClearingGeminiKey] = useState(false);
+  const [geminiAutoExtractEnabled, setGeminiAutoExtractEnabled] = useState(false);
+  const [isSavingGeminiSettings, setIsSavingGeminiSettings] = useState(false);
   const [apifyFetcherMode, setApifyFetcherMode] = useState<FetcherMode>("auto");
   const [apifyTestUrl, setApifyTestUrl] = useState("https://www.instagram.com/humansofny/");
   const [apifyTestLimit, setApifyTestLimit] = useState<number>(1);
@@ -327,6 +330,7 @@ const App = () => {
       const fetcher = systemSettings.instagram_fetcher ?? "auto";
       setApifyFetcherMode(fetcher);
       setApifyEnabledInput(fetcher === "apify" ? true : systemSettings.apify_enabled);
+      setGeminiAutoExtractEnabled(Boolean(systemSettings.gemini_auto_extract));
     }
   }, [systemSettings]);
 
@@ -645,6 +649,31 @@ const App = () => {
       handleApiError((err as Error).message);
     } finally {
       setIsClearingGeminiKey(false);
+    }
+  };
+
+  const handleSaveGeminiSettings = async () => {
+    try {
+      setIsSavingGeminiSettings(true);
+      const response = await fetch(`${API_BASE}/settings`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ gemini_auto_extract: geminiAutoExtractEnabled }),
+      });
+      if (!response.ok) {
+        const text = await response.text();
+        throw new Error(text || "Failed to update Gemini settings");
+      }
+      await fetchSystemSettings();
+      showSuccess(
+        geminiAutoExtractEnabled
+          ? "Gemini auto extraction enabled."
+          : "Gemini auto extraction disabled."
+      );
+    } catch (err) {
+      handleApiError((err as Error).message);
+    } finally {
+      setIsSavingGeminiSettings(false);
     }
   };
 
@@ -1287,6 +1316,28 @@ const App = () => {
                       : "Generate one in Google AI Studio → API Keys."}
                   </span>
                 </div>
+                <div className="flex flex-wrap items-center justify-between gap-3 pt-3 border-t border-gray-200">
+                  <label className="flex items-center gap-2 text-sm text-gray-700">
+                    <input
+                      type="checkbox"
+                      checked={geminiAutoExtractEnabled}
+                      onChange={(event) => setGeminiAutoExtractEnabled(event.target.checked)}
+                      className="h-4 w-4 rounded border-gray-300 text-purple-600 focus:ring-purple-500"
+                    />
+                    Auto extract new event posts with Gemini
+                  </label>
+                  <button
+                    onClick={handleSaveGeminiSettings}
+                    disabled={isSavingGeminiSettings}
+                    className="px-4 py-2 rounded-lg bg-purple-600 hover:bg-purple-700 text-white text-sm font-medium disabled:bg-purple-400"
+                  >
+                    {isSavingGeminiSettings ? "Saving..." : "Save preference"}
+                  </button>
+                </div>
+                <p className="text-xs text-gray-500">
+                  When enabled, freshly detected or approved event posts attempt extraction automatically.
+                  Requires a valid API key; failures fall back to manual review.
+                </p>
                 <p className="text-xs text-gray-500">
                   The key lives only in your local settings database; nothing is uploaded elsewhere.
                 </p>

@@ -8,7 +8,7 @@ import re
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
-from ..models import Post
+from ..models import Post, ExtractedEvent
 from ..utils.image_downloader import IMAGES_DIR, download_image
 
 try:  # pragma: no cover - dependency is optional for tests
@@ -217,3 +217,51 @@ def extract_event_data_for_post(post: Post, api_key: str) -> Tuple[Dict[str, Any
     image_bytes, mime_type, downloaded_filename = load_post_image(post)
     result = extract_event_json(image_bytes, mime_type, api_key)
     return result, downloaded_filename
+
+
+def auto_extract_for_post(post: Post, settings, *, overwrite: bool = False) -> bool:
+    """Auto-run Gemini extraction when enabled; swallow errors and report success status."""
+
+    if not getattr(settings, "gemini_auto_extract", False):
+        return False
+
+    api_key = (getattr(settings, "gemini_api_key", "") or "").strip() or os.getenv("GEMINI_API_KEY", "").strip()
+    if not api_key:
+        return False
+
+    if post.extracted_event and not overwrite:
+        return False
+
+    try:
+        payload, downloaded_filename = extract_event_data_for_post(post, api_key)
+    except GeminiExtractionError as exc:  # pragma: no cover - network failures
+        print(f"Gemini auto extraction failed for post {post.instagram_id}: {exc}")
+        return False
+
+    if downloaded_filename and downloaded_filename != post.local_image_path:
+        post.local_image_path = downloaded_filename
+
+    extraction_confidence = None
+    confidence_payload = None
+    if isinstance(payload, dict):
+        confidence_payload = payload.get("extractionConfidence")
+    if isinstance(confidence_payload, dict):
+        overall = confidence_payload.get("overall")
+        try:
+            extraction_confidence = float(overall) if overall is not None else None
+        except (TypeError, ValueError):
+            extraction_confidence = None
+
+    if post.extracted_event:
+        post.extracted_event.event_data_json = payload
+        if extraction_confidence is not None:
+            post.extracted_event.extraction_confidence = extraction_confidence
+    else:
+        post.extracted_event = ExtractedEvent(
+            post_id=post.id,
+            event_data_json=payload,
+            extraction_confidence=extraction_confidence,
+        )
+
+    post.processed = True
+    return True

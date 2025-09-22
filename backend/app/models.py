@@ -101,6 +101,7 @@ class SystemSetting(Base):
     apify_api_token = Column(String(512), nullable=True)
     instagram_fetcher = Column(String(20), default="auto", nullable=False)
     gemini_api_key = Column(String(512), nullable=True)
+    gemini_auto_extract = Column(Boolean, default=False, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
 
@@ -123,6 +124,8 @@ def ensure_default_settings(session) -> SystemSetting:
         alter_statements.append("ADD COLUMN instagram_fetcher VARCHAR(20) DEFAULT 'auto' NOT NULL")
     if "gemini_api_key" not in columns:
         alter_statements.append("ADD COLUMN gemini_api_key VARCHAR(512)")
+    if "gemini_auto_extract" not in columns:
+        alter_statements.append("ADD COLUMN gemini_auto_extract BOOLEAN DEFAULT 0 NOT NULL")
 
     if alter_statements:
         with bind.connect() as conn:
@@ -167,6 +170,9 @@ def ensure_default_settings(session) -> SystemSetting:
             updated = True
         if not hasattr(setting, "gemini_api_key"):
             setting.gemini_api_key = None
+            updated = True
+        if getattr(setting, "gemini_auto_extract", None) is None:
+            setting.gemini_auto_extract = False
             updated = True
     if updated:
         session.commit()

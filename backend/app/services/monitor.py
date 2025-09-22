@@ -19,6 +19,7 @@ from ..models import (
     DEFAULT_APIFY_ACTOR_ID as MODEL_DEFAULT_APIFY_ACTOR_ID,
 )
 from .classifier import CaptionClassifier
+from .gemini_extractor import auto_extract_for_post
 from ..utils.image_downloader import download_image
 from ..utils.apify_client import ApifyClient, ApifyClientError, ApifyRunTimeoutError
 
@@ -230,7 +231,7 @@ class MonitorService:
                     )
                 for post in posts:
                     auto_classify = global_auto and (club.classification_mode or ClassificationModeEnum.MANUAL).lower() == ClassificationModeEnum.AUTO
-                    if self._create_post_if_new(session, club, post, auto_classify):
+                    if self._create_post_if_new(session, club, post, auto_classify, settings):
                         stats["posts"] += 1
                         if auto_classify:
                             stats["classified"] += 1
@@ -269,7 +270,7 @@ class MonitorService:
 
         created = 0
         for post in posts:
-            if self._create_post_if_new(session, club, post, auto_classify):
+            if self._create_post_if_new(session, club, post, auto_classify, settings):
                 created += 1
 
         club.last_checked = datetime.utcnow()
@@ -387,7 +388,7 @@ class MonitorService:
                     )
                 for post in posts:
                     auto_classify = global_auto and (club.classification_mode or ClassificationModeEnum.MANUAL).lower() == ClassificationModeEnum.AUTO
-                    if self._create_post_if_new(session, club, post, auto_classify):
+                    if self._create_post_if_new(session, club, post, auto_classify, settings):
                         stats["posts"] += 1
                         if auto_classify:
                             stats["classified"] += 1
@@ -403,7 +404,14 @@ class MonitorService:
             session.rollback()
             raise
 
-    def _create_post_if_new(self, session: Session, club: Club, post: Dict, auto_classify: bool) -> bool:
+    def _create_post_if_new(
+        self,
+        session: Session,
+        club: Club,
+        post: Dict,
+        auto_classify: bool,
+        settings,
+    ) -> bool:
         existing = session.query(Post).filter(Post.instagram_id == post["id"]).one_or_none()
         if existing:
             return False
@@ -432,6 +440,12 @@ class MonitorService:
         )
         session.add(db_post)
         session.flush()
+
+        if is_event:
+            try:
+                auto_extract_for_post(db_post, settings, overwrite=False)
+            except Exception as exc:  # pragma: no cover - safeguard against unexpected errors
+                print(f"Gemini auto extraction error for post {db_post.instagram_id}: {exc}")
         return True
 
     def _apply_delay(self, delay_seconds: Optional[int]) -> None:
@@ -931,7 +945,7 @@ class MonitorService:
                 stats["missing_clubs"] += 1
                 continue
 
-            created = self._create_post_if_new(session, club, post_payload, auto_classify)
+            created = self._create_post_if_new(session, club, post_payload, auto_classify, settings)
             if created:
                 stats["created"] += 1
                 known_ids.add(post_payload["id"])
