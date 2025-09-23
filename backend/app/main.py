@@ -3,17 +3,19 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import os
+import json
 import shutil
 import tempfile
 import zipfile
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set
 
 from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from sqlalchemy import text
 from sqlalchemy.orm import Session, joinedload
 
 from .database import DB_PATH, SessionLocal, engine
@@ -26,6 +28,8 @@ from .models import (
     ensure_default_settings,
     DEFAULT_APIFY_ACTOR_ID,
 )
+from pydantic import ValidationError
+
 from .schemas import (
     CSVImportResponse,
     ClubOut,
@@ -124,6 +128,89 @@ def _cleanup_file(path: Path) -> None:
         pass
 
 
+def _clear_directory(path: Path) -> None:
+    if not path.exists():
+        return
+    for child in path.iterdir():
+        try:
+            if child.is_dir():
+                shutil.rmtree(child)
+            else:
+                child.unlink()
+        except OSError:
+            pass
+
+
+def _normalize_local_image_path(image_path: Optional[str]) -> Optional[str]:
+    if not image_path:
+        return None
+    normalized = image_path.replace("\\", "/")
+    if normalized.startswith("/static/images/"):
+        normalized = normalized[len("/static/images/") :]
+    return normalized.strip("/") or None
+
+
+def _import_event_export(data: Any) -> None:
+    if not isinstance(data, list):
+        raise HTTPException(status_code=400, detail="Event export JSON must be a list of clubs")
+
+    try:
+        clubs_export: List[ClubEventsExport] = [ClubEventsExport(**item) for item in data]
+    except ValidationError as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid event export format: {exc}") from exc
+
+    session = SessionLocal()
+    try:
+        session.execute(text("DELETE FROM extracted_events"))
+        session.execute(text("DELETE FROM posts"))
+        session.execute(text("DELETE FROM clubs"))
+        session.commit()
+
+        now = datetime.utcnow()
+        for club_export in clubs_export:
+            club = Club(
+                name=club_export.club_name,
+                username=club_export.club_username,
+                active=True,
+            )
+            session.add(club)
+            session.flush()
+
+            for event_export in club_export.events:
+                try:
+                    raw_ts = event_export.post_timestamp.replace("Z", "+00:00")
+                    post_timestamp = datetime.fromisoformat(raw_ts)
+                except Exception:
+                    post_timestamp = now
+
+                post = Post(
+                    club_id=club.id,
+                    instagram_id=event_export.post_instagram_id,
+                    image_url=event_export.post_image_url,
+                    local_image_path=_normalize_local_image_path(event_export.post_image_url),
+                    caption=event_export.post_caption,
+                    post_timestamp=post_timestamp,
+                    collected_at=now,
+                    is_event_poster=True,
+                    processed=True,
+                    classification_confidence=event_export.extraction_confidence,
+                )
+                session.add(post)
+                session.flush()
+
+                if event_export.payload is not None:
+                    extracted = ExtractedEvent(
+                        post_id=post.id,
+                        event_data_json=event_export.payload,
+                        extraction_confidence=event_export.extraction_confidence,
+                    )
+                    session.add(extracted)
+
+        session.commit()
+    finally:
+        session.close()
+
+
 @app.get("/export/full", response_class=FileResponse)
 async def export_full_backup(background_tasks: BackgroundTasks) -> FileResponse:
     timestamp = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
@@ -163,47 +250,62 @@ def _validate_zip_entry(name: str) -> None:
 
 @app.post("/import/full")
 async def import_full_backup(file: UploadFile = File(...)) -> Dict[str, str]:
-    if not file.filename.lower().endswith(".zip"):
-        raise HTTPException(status_code=400, detail="Upload a .zip archive")
+    filename = (file.filename or "").lower()
 
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".zip") as tmp:
+    if filename.endswith(".json"):
+        content = await file.read()
         try:
-            shutil.copyfileobj(file.file, tmp)
+            data = json.loads(content)
+        except json.JSONDecodeError as exc:
+            raise HTTPException(status_code=400, detail="Uploaded file is not valid JSON") from exc
         finally:
             file.file.close()
-        temp_zip_path = Path(tmp.name)
 
-    try:
-        with zipfile.ZipFile(temp_zip_path, "r") as archive:
-            if "instagram_monitor.db" not in archive.namelist():
-                raise HTTPException(status_code=400, detail="Archive missing instagram_monitor.db")
-            for info in archive.infolist():
-                _validate_zip_entry(info.filename)
+        _import_event_export(data)
+        message = "Event export imported successfully."
 
-            with tempfile.TemporaryDirectory() as extract_dir:
-                archive.extractall(path=extract_dir)
-                extract_path = Path(extract_dir)
-                new_db_path = extract_path / "instagram_monitor.db"
-                if not new_db_path.exists():
+    elif filename.endswith(".zip"):
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".zip") as tmp:
+            try:
+                shutil.copyfileobj(file.file, tmp)
+            finally:
+                file.file.close()
+            temp_zip_path = Path(tmp.name)
+
+        try:
+            with zipfile.ZipFile(temp_zip_path, "r") as archive:
+                if "instagram_monitor.db" not in archive.namelist():
                     raise HTTPException(status_code=400, detail="Archive missing instagram_monitor.db")
-                new_images_dir = extract_path / "static" / "images"
+                for info in archive.infolist():
+                    _validate_zip_entry(info.filename)
 
-                engine.dispose()
+                with tempfile.TemporaryDirectory() as extract_dir:
+                    archive.extractall(path=extract_dir)
+                    extract_path = Path(extract_dir)
+                    new_db_path = extract_path / "instagram_monitor.db"
+                    if not new_db_path.exists():
+                        raise HTTPException(status_code=400, detail="Archive missing instagram_monitor.db")
+                    new_images_dir = extract_path / "static" / "images"
 
-                DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(new_db_path, DB_PATH)
+                    engine.dispose()
 
-                if IMAGES_DIR.exists():
-                    shutil.rmtree(IMAGES_DIR)
-                if new_images_dir.exists():
-                    shutil.copytree(new_images_dir, IMAGES_DIR)
-                else:
+                    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(new_db_path, DB_PATH)
+
                     IMAGES_DIR.mkdir(parents=True, exist_ok=True)
+                    _clear_directory(IMAGES_DIR)
+                    if new_images_dir.exists():
+                        shutil.copytree(new_images_dir, IMAGES_DIR, dirs_exist_ok=True)
 
-    except zipfile.BadZipFile as exc:
-        raise HTTPException(status_code=400, detail="Uploaded file is not a valid zip archive") from exc
-    finally:
-        temp_zip_path.unlink(missing_ok=True)
+        except zipfile.BadZipFile as exc:
+            raise HTTPException(status_code=400, detail="Uploaded file is not a valid zip archive") from exc
+        finally:
+            temp_zip_path.unlink(missing_ok=True)
+
+        message = "Backup imported successfully."
+
+    else:
+        raise HTTPException(status_code=400, detail="Upload a .zip backup or event export .json file")
 
     session = SessionLocal()
     try:
@@ -213,7 +315,7 @@ async def import_full_backup(file: UploadFile = File(...)) -> Dict[str, str]:
     finally:
         session.close()
 
-    return {"message": "Backup imported successfully."}
+    return {"message": message}
 
 
 @app.get("/monitor/status", response_model=MonitorStatus)
