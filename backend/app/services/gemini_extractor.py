@@ -5,6 +5,7 @@ import json
 import mimetypes
 import os
 import re
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
@@ -103,6 +104,12 @@ Return ONLY a valid JSON object (no markdown, no explanation) in this exact stru
 - Don't invent or guess information
 - Note any ambiguities in extractionConfidence.notes
 
+### Using Provided Context
+- Additional context may include the Instagram post publication timestamp.
+- Prefer event years that are the same as or after that publication date unless the poster explicitly shows an earlier year.
+- When the poster omits the year, use the publication year if the month/day are on or after the post date; otherwise assume the following year.
+- If the poster clearly states a year, use that value even if it conflicts with the guidance above.
+
 Remember: Output ONLY the JSON object, no additional text or formatting."""
 
 
@@ -183,6 +190,7 @@ def extract_event_json(
     mime_type: str,
     api_key: str,
     caption: Optional[str] = None,
+    post_timestamp: Optional[datetime] = None,
 ) -> Dict[str, Any]:
     model = _ensure_model(api_key)
     image_part = {
@@ -192,15 +200,24 @@ def extract_event_json(
         }
     }
     prompt_part = {"text": GEMINI_PROMPT}
-    caption_part = None
-    if caption:
-        caption_part = {
-            "text": f"Instagram caption (additional context):\n{caption}"
-        }
 
     parts = [image_part, prompt_part]
-    if caption_part:
-        parts.append(caption_part)
+
+    context_sections = []
+    if post_timestamp:
+        ts = post_timestamp.replace(microsecond=0)
+        timestamp_text = ts.isoformat()
+        context_sections.append(
+            "Instagram post publication details:\n"
+            f"- Published on {timestamp_text}.\n"
+            "- Treat events as upcoming relative to this date unless the poster clearly indicates an earlier year."
+        )
+
+    if caption:
+        context_sections.append(f"Instagram caption (additional context):\n{caption}")
+
+    if context_sections:
+        parts.append({"text": "Additional context:\n" + "\n\n".join(context_sections)})
 
     try:
         response = model.generate_content(parts)
@@ -229,7 +246,13 @@ def extract_event_data_for_post(post: Post, api_key: str) -> Tuple[Dict[str, Any
     """Extract event JSON for a post and return payload plus optional new local filename."""
 
     image_bytes, mime_type, downloaded_filename = load_post_image(post)
-    result = extract_event_json(image_bytes, mime_type, api_key, caption=post.caption)
+    result = extract_event_json(
+        image_bytes,
+        mime_type,
+        api_key,
+        caption=post.caption,
+        post_timestamp=post.post_timestamp,
+    )
     return result, downloaded_filename
 
 

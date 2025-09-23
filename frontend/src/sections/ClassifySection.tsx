@@ -4,6 +4,94 @@ import type { PostRecord } from "../types";
 import { formatTimestamp } from "../utils/format";
 import { getPostImageUrl } from "../utils/image";
 
+const parseEventPayload = (payload: unknown): Record<string, unknown> | null => {
+  if (!payload) {
+    return null;
+  }
+  if (typeof payload === "string") {
+    try {
+      const parsed = JSON.parse(payload);
+      return typeof parsed === "object" && parsed !== null ? (parsed as Record<string, unknown>) : null;
+    } catch (error) {
+      console.warn("Failed to parse event JSON payload", error);
+      return null;
+    }
+  }
+  if (typeof payload === "object") {
+    return payload as Record<string, unknown>;
+  }
+  return null;
+};
+
+const getEventSummary = (
+  payload: Record<string, unknown> | null,
+): {
+  title: string | null;
+  startDate: string | null;
+  startTime: string | null;
+  venueName: string | null;
+} | null => {
+  if (!payload) {
+    return null;
+  }
+
+  const eventsRaw = (payload as { events?: unknown }).events;
+  const events = Array.isArray(eventsRaw) ? eventsRaw : [];
+  const firstEvent = events.find((event) => event && typeof event === "object") as
+    | Record<string, unknown>
+    | undefined;
+
+  if (!firstEvent) {
+    return null;
+  }
+
+  const venueRaw = (firstEvent as { venue?: unknown }).venue;
+  const venue = typeof venueRaw === "object" && venueRaw !== null
+    ? (venueRaw as Record<string, unknown>)
+    : null;
+
+  const venueNameRaw = venue ? (venue as { name?: unknown }).name : null;
+
+  const titleRaw = (firstEvent as { title?: unknown }).title;
+  const startDateRaw = (firstEvent as { startDate?: unknown }).startDate;
+  const startTimeRaw = (firstEvent as { startTime?: unknown }).startTime;
+
+  const title = typeof titleRaw === "string" ? titleRaw : null;
+  const startDate = typeof startDateRaw === "string" ? startDateRaw : null;
+  const startTime = typeof startTimeRaw === "string" ? startTimeRaw : null;
+  const venueName = typeof venueNameRaw === "string" ? venueNameRaw : null;
+
+  if (!title && !startDate && !startTime && !venueName) {
+    return null;
+  }
+
+  return {
+    title,
+    startDate,
+    startTime,
+    venueName,
+  };
+};
+
+const formatEventStart = (startDate: string | null, startTime: string | null): string | null => {
+  if (!startDate) {
+    return null;
+  }
+
+  const trimmedDate = startDate.trim();
+  const trimmedTime = startTime?.trim();
+
+  if (!trimmedTime) {
+    const formatted = formatTimestamp(trimmedDate);
+    return formatted !== trimmedDate ? formatted : trimmedDate;
+  }
+
+  const isoCandidate = trimmedDate.includes("T") ? trimmedDate : `${trimmedDate}T${trimmedTime}`;
+  const formatted = formatTimestamp(isoCandidate);
+  const fallback = `${trimmedDate} ${trimmedTime}`.trim();
+  return formatted !== isoCandidate ? formatted : fallback;
+};
+
 interface ReviewQueueItem {
   post: PostRecord;
   source: "ai" | "manual";
@@ -141,6 +229,10 @@ export const ClassifySection = ({
       <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-6">
         {eventPosts.map((post) => {
           const imageUrl = getPostImageUrl(post);
+          const eventPayload = parseEventPayload(post.extracted_event?.event_data_json);
+          const eventSummary = getEventSummary(eventPayload);
+          const eventStart = eventSummary ? formatEventStart(eventSummary.startDate, eventSummary.startTime) : null;
+          const eventJsonPretty = eventPayload ? JSON.stringify(eventPayload, null, 2) : null;
           return (
             <article key={post.id} className="border border-gray-200 rounded-lg overflow-hidden">
               <div className="bg-gray-100 h-44 flex items-center justify-center text-gray-500 text-sm">
@@ -175,7 +267,38 @@ export const ClassifySection = ({
                 <div className="text-xs text-gray-400">
                   <p>Collected: {formatTimestamp(post.collected_at)}</p>
                   <p>Post time: {formatTimestamp(post.post_timestamp)}</p>
+                  {eventStart && <p>Event start: {eventStart}</p>}
                 </div>
+                {eventSummary && (
+                  <div className="text-xs bg-purple-50 border border-purple-100 rounded-md p-3 space-y-1 text-purple-800">
+                    {eventSummary.title && (
+                      <p>
+                        <span className="font-semibold">Event:</span> {eventSummary.title}
+                      </p>
+                    )}
+                    {eventSummary.venueName && (
+                      <p>
+                        <span className="font-semibold">Venue:</span> {eventSummary.venueName}
+                      </p>
+                    )}
+                    {eventSummary.startDate && !eventStart && (
+                      <p>
+                        <span className="font-semibold">Starts:</span> {eventSummary.startDate}
+                        {eventSummary.startTime ? ` ${eventSummary.startTime}` : ""}
+                      </p>
+                    )}
+                  </div>
+                )}
+                {eventJsonPretty && (
+                  <details className="text-xs text-gray-600 bg-gray-50 border border-gray-200 rounded-md p-2">
+                    <summary className="cursor-pointer font-medium text-gray-700">
+                      View event JSON
+                    </summary>
+                    <pre className="mt-2 whitespace-pre-wrap break-words font-mono text-[11px] max-h-48 overflow-auto text-gray-700">
+                      {eventJsonPretty}
+                    </pre>
+                  </details>
+                )}
                 <div className="flex flex-col gap-2">
                   <button
                     onClick={() => onOpenEventModal(post)}

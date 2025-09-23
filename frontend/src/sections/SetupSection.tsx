@@ -1,4 +1,4 @@
-import { ChangeEvent, useRef } from "react";
+import { ChangeEvent, useMemo, useRef, useState } from "react";
 import { Database, Sparkles, Upload, RefreshCcw, Settings } from "lucide-react";
 
 import type { Club, FetcherMode, StatsSnapshot, SystemSettings } from "../types";
@@ -233,6 +233,40 @@ const SetupSectionContent = ({
   backupFileInputKey,
 }: SetupSectionContentProps) => {
   const backupInputRef = useRef<HTMLInputElement | null>(null);
+  const [clubFilter, setClubFilter] = useState<"active" | "inactive" | "all">("active");
+
+  const filterCounts = useMemo(() => {
+    const activeCount = clubs.filter((club) => club.active).length;
+    const inactiveCount = clubs.length - activeCount;
+    return {
+      active: activeCount,
+      inactive: inactiveCount,
+      all: clubs.length,
+    } as const;
+  }, [clubs]);
+
+  const filteredClubs = useMemo(() => {
+    if (clubFilter === "active") {
+      return clubs.filter((club) => club.active);
+    }
+    if (clubFilter === "inactive") {
+      return clubs.filter((club) => !club.active);
+    }
+    return clubs;
+  }, [clubs, clubFilter]);
+
+  const emptyStateMessage = useMemo(() => {
+    if (clubs.length === 0) {
+      return "Upload a CSV to start tracking clubs.";
+    }
+    if (clubFilter === "active") {
+      return "No active clubs. Toggle some on or switch the filter.";
+    }
+    if (clubFilter === "inactive") {
+      return "No inactive clubs right now.";
+    }
+    return "No clubs match this filter.";
+  }, [clubs, clubFilter]);
 
   const handleBackupFileChange = (event: ChangeEvent<HTMLInputElement>) => {
     const selected = event.target.files?.[0];
@@ -258,12 +292,42 @@ const SetupSectionContent = ({
     </section>
 
     <section className="bg-white rounded-xl shadow-sm p-6">
-      <div className="flex items-center justify-between mb-4">
+      <div className="flex flex-col gap-3 mb-4 sm:flex-row sm:items-center sm:justify-between">
         <h2 className="text-xl font-semibold">Tracked Clubs</h2>
-        <span className="text-sm text-gray-500">{stats ? `${stats.active_clubs}/${stats.total_clubs} active` : "—"}</span>
+        <div className="flex flex-wrap items-center gap-2">
+          <span className="text-sm text-gray-500">
+            {stats ? `${stats.active_clubs}/${stats.total_clubs} active` : "—"}
+          </span>
+          <div className="flex rounded-lg border border-gray-200 p-0.5 text-xs font-medium text-gray-600 bg-gray-50">
+            {([
+              { id: "active" as const, label: "Active" },
+              { id: "inactive" as const, label: "Inactive" },
+              { id: "all" as const, label: "All" },
+            ]).map((option) => {
+              const isSelected = clubFilter === option.id;
+              return (
+                <button
+                  key={option.id}
+                  type="button"
+                  onClick={() => setClubFilter(option.id)}
+                  className={`px-2.5 py-1 rounded-md transition-colors ${
+                    isSelected
+                      ? "bg-white text-purple-600 shadow"
+                      : "text-gray-600 hover:text-gray-800"
+                  }`}
+                >
+                  {option.label}
+                  <span className="ml-1 text-[11px] text-gray-400">
+                    {filterCounts[option.id]}
+                  </span>
+                </button>
+              );
+            })}
+          </div>
+        </div>
       </div>
       <div className="space-y-3 max-h-96 overflow-y-auto pr-2">
-        {clubs.map((club) => (
+        {filteredClubs.map((club) => (
           <div key={club.id} className="flex items-center justify-between border border-gray-200 rounded-lg p-3">
             <div>
               <a
@@ -303,7 +367,9 @@ const SetupSectionContent = ({
             </div>
           </div>
         ))}
-        {clubs.length === 0 && <p className="text-sm text-gray-500">Upload a CSV to start tracking clubs.</p>}
+        {filteredClubs.length === 0 && (
+          <p className="text-sm text-gray-500">{emptyStateMessage}</p>
+        )}
       </div>
     </section>
 
