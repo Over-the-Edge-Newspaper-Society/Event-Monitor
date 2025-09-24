@@ -289,13 +289,29 @@ async def import_full_backup(file: UploadFile = File(...)) -> Dict[str, str]:
 
                     engine.dispose()
 
-                    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(new_db_path, DB_PATH)
+                    try:
+                        # Copy database
+                        DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(new_db_path, DB_PATH)
 
-                    IMAGES_DIR.mkdir(parents=True, exist_ok=True)
-                    _clear_directory(IMAGES_DIR)
-                    if new_images_dir.exists():
-                        shutil.copytree(new_images_dir, IMAGES_DIR, dirs_exist_ok=True)
+                        # Copy images with better error handling
+                        IMAGES_DIR.mkdir(parents=True, exist_ok=True)
+                        _clear_directory(IMAGES_DIR)
+                        if new_images_dir.exists():
+                            # Copy files one by one to handle permission issues
+                            for src_file in new_images_dir.rglob("*"):
+                                if src_file.is_file():
+                                    rel_path = src_file.relative_to(new_images_dir)
+                                    dst_file = IMAGES_DIR / rel_path
+                                    dst_file.parent.mkdir(parents=True, exist_ok=True)
+                                    try:
+                                        shutil.copy2(src_file, dst_file)
+                                    except OSError as e:
+                                        print(f"Warning: Could not copy {src_file}: {e}")
+                                        # Continue with other files
+                    except Exception as e:
+                        print(f"Error during import: {e}")
+                        raise HTTPException(status_code=500, detail=f"Import failed: {str(e)}")
 
         except zipfile.BadZipFile as exc:
             raise HTTPException(status_code=400, detail="Uploaded file is not a valid zip archive") from exc

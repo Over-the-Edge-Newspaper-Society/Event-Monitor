@@ -19,6 +19,16 @@ services:
       - APIFY_FETCHER_MODE=${APIFY_FETCHER_MODE:-}
       - APIFY_ACTOR_ID=${APIFY_ACTOR_ID:-}
     restart: unless-stopped
+    # Run initial commands as root to fix permissions, then switch to www-data
+    user: root
+    command: >
+      sh -c "
+      echo 'Fixing permissions...' &&
+      mkdir -p /data /app/app/static/images /app/app/instaloader_session &&
+      chown -R www-data:www-data /data /app/app/static/images /app/app/instaloader_session &&
+      echo 'Starting application as www-data...' &&
+      su -s /bin/sh www-data -c 'uvicorn app.main:app --host 0.0.0.0 --port 8000'
+      "
 
   frontend:
     build:

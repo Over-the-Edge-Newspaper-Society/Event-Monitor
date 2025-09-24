@@ -27,9 +27,16 @@ RUN npm --prefix app/utils/apify_node_runner install --omit=dev
 RUN mkdir -p /data app/static/images app/instaloader_session \
     && chown -R www-data:www-data /app /data
 
+# Create entrypoint script to fix permissions after volume mount
+RUN echo '#!/bin/sh\n\
+mkdir -p /data /app/app/static/images /app/app/instaloader_session\n\
+chown -R www-data:www-data /data /app/app/static/images /app/app/instaloader_session || true\n\
+exec "$@"' > /entrypoint.sh && chmod +x /entrypoint.sh
+
 USER www-data
 
 ENV PYTHONPATH=/app
 EXPOSE 8000
 
+ENTRYPOINT ["/entrypoint.sh"]
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
