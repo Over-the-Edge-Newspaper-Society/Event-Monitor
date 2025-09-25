@@ -52,7 +52,6 @@ const App = () => {
   const [isSavingDelay, setIsSavingDelay] = useState(false);
   const [sessionFileKey, setSessionFileKey] = useState(() => Date.now().toString());
   const [sessionCookieInput, setSessionCookieInput] = useState("");
-  const [apifyEnabledInput, setApifyEnabledInput] = useState(false);
   const [apifyResultsLimitInput, setApifyResultsLimitInput] = useState<number>(30);
   const [apifyTokenInput, setApifyTokenInput] = useState("");
   const [isSavingApifySettings, setIsSavingApifySettings] = useState(false);
@@ -66,7 +65,7 @@ const App = () => {
   const [isDownloadingBackup, setIsDownloadingBackup] = useState(false);
   const [isRestoringBackup, setIsRestoringBackup] = useState(false);
   const [backupFileInputKey, setBackupFileInputKey] = useState(() => Date.now().toString());
-  const [apifyFetcherMode, setApifyFetcherMode] = useState<FetcherMode>("auto");
+  const [apifyFetcherMode, setApifyFetcherMode] = useState<FetcherMode>("instaloader");
   const [apifyTestUrl, setApifyTestUrl] = useState("https://www.instagram.com/humansofny/");
   const [apifyTestLimit, setApifyTestLimit] = useState<number>(1);
   const [apifyTestResult, setApifyTestResult] = useState<ApifyTestResult | null>(null);
@@ -189,9 +188,8 @@ const App = () => {
       setSessionUsernameInput(systemSettings.instaloader_username ?? "");
       setClubDelayInput(systemSettings.club_fetch_delay_seconds);
       setApifyResultsLimitInput(systemSettings.apify_results_limit);
-      const fetcher = systemSettings.instagram_fetcher ?? "auto";
-      setApifyFetcherMode(fetcher);
-      setApifyEnabledInput(fetcher === "apify" ? true : systemSettings.apify_enabled);
+      const fetcher = systemSettings.instagram_fetcher ?? "instaloader";
+      setApifyFetcherMode(fetcher === "apify" ? "apify" : "instaloader");
       setGeminiAutoExtractEnabled(Boolean(systemSettings.gemini_auto_extract));
     }
   }, [systemSettings]);
@@ -415,7 +413,7 @@ const App = () => {
     try {
       setIsSavingApifySettings(true);
       const payload: Record<string, unknown> = {
-        apify_enabled: apifyEnabledInput,
+        apify_enabled: apifyFetcherMode === "apify",
         apify_results_limit: apifyResultsLimitInput,
         instagram_fetcher: apifyFetcherMode,
       };
@@ -1112,7 +1110,6 @@ const App = () => {
     sessionUsernameInput,
     sessionCookieInput,
     clubDelayInput,
-    apifyEnabledInput,
     apifyResultsLimitInput,
     apifyTokenInput,
     geminiApiKeyInput,
@@ -1144,7 +1141,6 @@ const App = () => {
     onClubDelayChange: setClubDelayInput,
     onSaveDelay: handleSaveDelay,
     onFetcherModeChange: setApifyFetcherMode,
-    onApifyEnabledChange: setApifyEnabledInput,
     onApifyResultsLimitChange: setApifyResultsLimitInput,
     onSaveApifySettings: handleSaveApifySettings,
     onApifyTokenChange: setApifyTokenInput,

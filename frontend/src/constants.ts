@@ -3,7 +3,6 @@ import { CheckCircle, Image as ImageIcon, Monitor, Settings } from "lucide-react
 import type { TabsConfig } from "./types";
 
 export const FETCHER_LABELS: Record<FetcherMode, string> = {
-  auto: "Auto (hybrid)",
   instaloader: "Instaloader only",
   apify: "Apify only",
 };

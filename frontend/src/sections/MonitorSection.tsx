@@ -119,7 +119,9 @@ export const MonitorSection = ({
             <p className="text-xs text-blue-500 mt-1">
               Fetcher: {status ? FETCHER_LABELS[status.instagram_fetcher] : "—"}
             </p>
-            <p className="text-xs text-blue-500 mt-1">Apify fallback: {status?.apify_enabled ? "Enabled" : "Disabled"}</p>
+            <p className="text-xs text-blue-500 mt-1">
+              Apify token: {systemSettings?.has_apify_token ? "Saved" : "Missing"}
+            </p>
             <p className="text-xs text-blue-500 mt-1">Apify runner: {status ? APIFY_RUNNER_LABELS[status.apify_runner] : "—"}</p>
           </div>
           <div className="bg-purple-50 rounded-lg p-4">
@@ -193,7 +195,9 @@ export const MonitorSection = ({
             </h3>
             <p className="text-sm text-gray-600">Workflow: {systemSettings ? (systemSettings.classification_mode === "auto" ? "AI" : "Manual") : "—"}</p>
             <p className="text-sm text-gray-600">Fetch delay: {describeMinutes(systemSettings?.club_fetch_delay_seconds ?? null)}</p>
-            <p className="text-sm text-gray-600">Apify fallback: {systemSettings?.apify_enabled ? "Enabled" : "Disabled"}</p>
+            <p className="text-sm text-gray-600">
+              Scraper mode: {systemSettings ? FETCHER_LABELS[systemSettings.instagram_fetcher] : "—"}
+            </p>
             <p className="text-sm text-gray-600">Gemini auto extract: {systemSettings?.gemini_auto_extract ? "Enabled" : "Disabled"}</p>
           </div>
         </div>

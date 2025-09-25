@@ -1,6 +1,6 @@
 import type { ComponentType } from "react";
 
-export type FetcherMode = "auto" | "instaloader" | "apify";
+export type FetcherMode = "instaloader" | "apify";
 
 export type ApifyRunnerMode = "disabled" | "unconfigured" | "rest" | "rest_fallback" | "node";
 

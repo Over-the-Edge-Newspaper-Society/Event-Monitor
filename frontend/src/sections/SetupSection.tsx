@@ -14,7 +14,6 @@ interface SetupSectionProps {
   sessionUsernameInput: string;
   sessionCookieInput: string;
   clubDelayInput: number;
-  apifyEnabledInput: boolean;
   apifyResultsLimitInput: number;
   apifyTokenInput: string;
   geminiApiKeyInput: string;
@@ -46,7 +45,6 @@ interface SetupSectionProps {
   onClubDelayChange: (value: number) => void;
   onSaveDelay: () => VoidOrPromise;
   onFetcherModeChange: (mode: FetcherMode) => void;
-  onApifyEnabledChange: (value: boolean) => void;
   onApifyResultsLimitChange: (value: number) => void;
   onSaveApifySettings: () => VoidOrPromise;
   onApifyTokenChange: (value: string) => void;
@@ -70,7 +68,6 @@ export const SetupSection = ({
   sessionUsernameInput,
   sessionCookieInput,
   clubDelayInput,
-  apifyEnabledInput,
   apifyResultsLimitInput,
   apifyTokenInput,
   geminiApiKeyInput,
@@ -102,7 +99,6 @@ export const SetupSection = ({
   onClubDelayChange,
   onSaveDelay,
   onFetcherModeChange,
-  onApifyEnabledChange,
   onApifyResultsLimitChange,
   onSaveApifySettings,
   onApifyTokenChange,
@@ -125,7 +121,6 @@ export const SetupSection = ({
     sessionUsernameInput={sessionUsernameInput}
     sessionCookieInput={sessionCookieInput}
     clubDelayInput={clubDelayInput}
-    apifyEnabledInput={apifyEnabledInput}
     apifyResultsLimitInput={apifyResultsLimitInput}
     apifyTokenInput={apifyTokenInput}
     geminiApiKeyInput={geminiApiKeyInput}
@@ -157,7 +152,6 @@ export const SetupSection = ({
     onClubDelayChange={onClubDelayChange}
     onSaveDelay={onSaveDelay}
     onFetcherModeChange={onFetcherModeChange}
-    onApifyEnabledChange={onApifyEnabledChange}
     onApifyResultsLimitChange={onApifyResultsLimitChange}
     onSaveApifySettings={onSaveApifySettings}
     onApifyTokenChange={onApifyTokenChange}
@@ -184,7 +178,6 @@ const SetupSectionContent = ({
   sessionUsernameInput,
   sessionCookieInput,
   clubDelayInput,
-  apifyEnabledInput,
   apifyResultsLimitInput,
   apifyTokenInput,
   geminiApiKeyInput,
@@ -216,7 +209,6 @@ const SetupSectionContent = ({
   onClubDelayChange,
   onSaveDelay,
   onFetcherModeChange,
-  onApifyEnabledChange,
   onApifyResultsLimitChange,
   onSaveApifySettings,
   onApifyTokenChange,
@@ -439,12 +431,70 @@ const SetupSectionContent = ({
           Requires a valid API key; failures fall back to manual review.
         </p>
         <p className="text-xs text-gray-500">
-          The key lives only in your local settings database; nothing is uploaded elsewhere.
-        </p>
-      </div>
-    </section>
+      The key lives only in your local settings database; nothing is uploaded elsewhere.
+    </p>
+  </div>
+</section>
 
-    <section className="bg-white rounded-xl shadow-sm p-6 space-y-4">
+<section className="bg-white rounded-xl shadow-sm p-6 space-y-4">
+  <div className="flex items-center justify-between">
+    <h2 className="text-xl font-semibold flex items-center gap-2">
+      <Settings className="h-5 w-5 text-purple-600" />
+      Scraper Mode
+    </h2>
+    <span className="text-sm font-semibold text-purple-600">
+      {FETCHER_LABELS[apifyFetcherMode]}
+    </span>
+  </div>
+  <p className="text-sm text-gray-600">
+    Choose how the monitor pulls Instagram posts. Instaloader runs with your logged-in session; Apify calls their API.
+  </p>
+  <div className="space-y-3">
+    <label className="block text-sm font-medium text-gray-700">Scrape using</label>
+    <select
+      value={apifyFetcherMode}
+      onChange={(event) => onFetcherModeChange(event.target.value as FetcherMode)}
+      className="w-full sm:w-64 rounded-lg border border-gray-300 px-3 py-2 text-sm focus:border-purple-500 focus:outline-none focus:ring-2 focus:ring-purple-200"
+    >
+      {Object.entries(FETCHER_LABELS).map(([key, label]) => (
+        <option key={key} value={key}>
+          {label}
+        </option>
+      ))}
+    </select>
+    <p className="text-xs text-gray-500">
+      {apifyFetcherMode === "instaloader"
+        ? "Requires an Instaloader session file or browser cookies to act like a real account."
+        : "Requires an Apify actor ID and personal API token. Configure these in the Apify Integration section below."}
+    </p>
+  </div>
+  {apifyFetcherMode === "instaloader" ? (
+    <div className="flex flex-wrap items-center gap-3">
+      <button
+        onClick={onSaveApifySettings}
+        disabled={isSavingApifySettings}
+        className="px-4 py-2 rounded-lg bg-purple-600 hover:bg-purple-700 text-white text-sm font-medium disabled:bg-purple-400"
+      >
+        {isSavingApifySettings ? "Saving..." : "Save scraper mode"}
+      </button>
+      <span className="text-xs text-gray-500">Mode changes take effect after saving.</span>
+    </div>
+  ) : (
+    <div className="flex flex-wrap items-center gap-3">
+      <button
+        onClick={onSaveApifySettings}
+        disabled={isSavingApifySettings}
+        className="px-4 py-2 rounded-lg bg-purple-600 hover:bg-purple-700 text-white text-sm font-medium disabled:bg-purple-400"
+      >
+        {isSavingApifySettings ? "Saving..." : "Save scraper mode"}
+      </button>
+      <span className="text-xs text-gray-500">Mode changes take effect after saving.</span>
+    </div>
+  )}
+</section>
+
+    {apifyFetcherMode === "instaloader" && (
+      <section className="bg-white rounded-xl shadow-sm p-6 space-y-4">
       <div className="flex items-center justify-between">
         <h2 className="text-xl font-semibold flex items-center gap-2">
           <Settings className="h-5 w-5 text-purple-600" />
@@ -517,6 +567,7 @@ const SetupSectionContent = ({
         </div>
       </div>
     </section>
+    )}
 
     <section className="bg-white rounded-xl shadow-sm p-6 space-y-4">
       <div className="flex items-center justify-between">
@@ -574,108 +625,78 @@ const SetupSectionContent = ({
       </div>
     </section>
 
-    <section className="bg-white rounded-xl shadow-sm p-6 space-y-4">
-      <div className="flex items-center justify-between">
-        <h2 className="text-xl font-semibold flex items-center gap-2">
-          <Database className="h-5 w-5 text-purple-600" />
-          Apify Integration
-        </h2>
-        <span className="text-xs text-gray-500">{systemSettings?.apify_enabled ? "Enabled" : "Disabled"}</span>
-      </div>
-      <p className="text-sm text-gray-600">
-        Choose whether to pull posts with Instaloader, Apify, or let the app switch automatically after
-        rate limits. Provide your Apify actor ID and API token if you plan to use Apify.
-      </p>
-      <div className="space-y-4">
-        <div>
-          <label className="block text-sm font-medium text-gray-700">Fetcher preference</label>
-          <select
-            value={apifyFetcherMode}
-            onChange={(event) => onFetcherModeChange(event.target.value as FetcherMode)}
-            className="w-full sm:w-64 rounded-lg border border-gray-300 px-3 py-2 text-sm focus:border-purple-500 focus:outline-none focus:ring-2 focus:ring-purple-200"
-          >
-            {Object.entries(FETCHER_LABELS).map(([key, label]) => (
-              <option key={key} value={key}>
-                {label}
-              </option>
-            ))}
-          </select>
-          <p className="text-xs text-gray-500 mt-1">
-            Auto keeps Instaloader as primary; Apify is used only when needed.
-          </p>
-        </div>
-        <label className="flex items-center gap-2 text-sm text-gray-700">
-          <input
-            type="checkbox"
-            checked={apifyEnabledInput}
-            onChange={(event) => onApifyEnabledChange(event.target.checked)}
-            disabled={apifyFetcherMode === "apify"}
-            className="h-4 w-4 rounded border-gray-300 text-purple-600 focus:ring-purple-500 disabled:opacity-60"
-          />
-          Enable Apify fallback (used in auto mode)
-        </label>
-        <div>
-          <label className="block text-sm font-medium text-gray-700">Results limit per club</label>
-          <input
-            type="number"
-            min={1}
-            max={1000}
-            value={apifyResultsLimitInput}
-            onChange={(event) => {
-              const value = Number(event.target.value);
-              if (!Number.isNaN(value)) {
-                onApifyResultsLimitChange(Math.min(Math.max(1, Math.round(value)), 1000));
-              }
-            }}
-            className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:border-purple-500 focus:outline-none focus:ring-2 focus:ring-purple-200"
-          />
-          <p className="text-xs text-gray-500 mt-1">How many posts to request from Apify when invoked.</p>
-        </div>
-        <div className="flex flex-wrap items-center gap-3">
-          <button
-            onClick={onSaveApifySettings}
-            disabled={isSavingApifySettings}
-            className="px-4 py-2 rounded-lg bg-purple-600 hover:bg-purple-700 text-white text-sm font-medium disabled:bg-purple-400"
-          >
-            {isSavingApifySettings ? "Saving..." : "Save Apify settings"}
-          </button>
+    {apifyFetcherMode === "apify" && (
+      <section className="bg-white rounded-xl shadow-sm p-6 space-y-4">
+        <div className="flex items-center justify-between">
+          <h2 className="text-xl font-semibold flex items-center gap-2">
+            <Database className="h-5 w-5 text-purple-600" />
+            Apify Integration
+          </h2>
           <span className="text-xs text-gray-500">
-            Limit and fetcher updates apply immediately to the next monitor run.
+            {systemSettings?.has_apify_token ? "Token saved" : "Token missing"}
           </span>
         </div>
-        <div className="border-t border-gray-200 pt-4 space-y-3">
-          <label className="block text-sm font-medium text-gray-700">Apify personal API token</label>
-          <input
-            type="password"
-            value={apifyTokenInput}
-            onChange={(event) => onApifyTokenChange(event.target.value)}
-            placeholder="apify_api_... (from Personal API tokens)"
-            className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:border-purple-500 focus:outline-none focus:ring-2 focus:ring-purple-200"
-          />
+        <p className="text-sm text-gray-600">
+          Configure Apify scraping. Provide your actor ID (defaults to the built-in template) and personal API token.
+        </p>
+        <div className="space-y-4">
+          <div>
+            <label className="block text-sm font-medium text-gray-700">Results limit per club</label>
+            <input
+              type="number"
+              min={1}
+              max={1000}
+              value={apifyResultsLimitInput}
+              onChange={(event) => {
+                const value = Number(event.target.value);
+                if (!Number.isNaN(value)) {
+                  onApifyResultsLimitChange(Math.min(Math.max(1, Math.round(value)), 1000));
+                }
+              }}
+              className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:border-purple-500 focus:outline-none focus:ring-2 focus:ring-purple-200"
+            />
+            <p className="text-xs text-gray-500 mt-1">How many posts to request from Apify when invoked.</p>
+          </div>
           <div className="flex flex-wrap items-center gap-3">
             <button
-              onClick={onSaveApifyToken}
-              disabled={isSavingApifyToken}
-              className="px-4 py-2 rounded-lg bg-green-600 hover:bg-green-700 text-white text-sm font-medium disabled:bg-green-400"
+              onClick={onSaveApifySettings}
+              disabled={isSavingApifySettings}
+              className="px-4 py-2 rounded-lg bg-purple-600 hover:bg-purple-700 text-white text-sm font-medium disabled:bg-purple-400"
             >
-              {isSavingApifyToken ? "Saving token..." : "Save token"}
+              {isSavingApifySettings ? "Saving..." : "Save Apify settings"}
             </button>
-            <button
-              onClick={onClearApifyToken}
-              disabled={!systemSettings?.has_apify_token || isClearingApifyToken}
-              className="px-4 py-2 rounded-lg border border-red-200 text-sm font-medium text-red-600 hover:bg-red-50 disabled:border-gray-200 disabled:text-gray-400"
-            >
-              {isClearingApifyToken ? "Removing..." : "Remove token"}
-            </button>
-            <span className="text-xs text-gray-500">
-              {systemSettings?.has_apify_token
-                ? "Token stored securely."
-                : "Open Apify Console → Integrations → Personal API tokens to generate one."}
-            </span>
+            <span className="text-xs text-gray-500">Mode and limit changes apply after saving.</span>
+          </div>
+          <div className="border-t border-gray-200 pt-4 space-y-3">
+            <label className="block text-sm font-medium text-gray-700">Apify personal API token</label>
+            <input
+              type="password"
+              value={apifyTokenInput}
+              onChange={(event) => onApifyTokenChange(event.target.value)}
+              placeholder="apify_api_... (from Personal API tokens)"
+              className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:border-purple-500 focus:outline-none focus:ring-2 focus:ring-purple-200"
+            />
+            <div className="flex flex-wrap items-center gap-3">
+              <button
+                onClick={onSaveApifyToken}
+                disabled={isSavingApifyToken}
+                className="px-4 py-2 rounded-lg bg-green-600 hover:bg-green-700 text-white text-sm font-medium disabled:bg-green-400"
+              >
+                {isSavingApifyToken ? "Saving..." : "Save token"}
+              </button>
+              <button
+                onClick={onClearApifyToken}
+                disabled={!systemSettings?.has_apify_token || isClearingApifyToken}
+                className="px-4 py-2 rounded-lg text-sm font-medium border border-red-200 text-red-600 hover:bg-red-50 disabled:opacity-50"
+              >
+                {isClearingApifyToken ? "Removing..." : "Remove token"}
+              </button>
+              <span className="text-xs text-gray-500">Token stored securely.</span>
+            </div>
           </div>
         </div>
-      </div>
-    </section>
+      </section>
+    )}
 
     <section className="bg-white rounded-xl shadow-sm p-6 space-y-4">
       <div className="flex items-center justify-between">

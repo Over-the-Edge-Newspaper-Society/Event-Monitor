@@ -5,6 +5,7 @@ import json
 import os
 import random
 import time
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
@@ -69,6 +70,9 @@ class MonitorService:
         self._apify_client: Optional[ApifyClient] = None
         self._apify_signature: Optional[str] = None
         self._apify_timeout_seconds = int(os.getenv("APIFY_RUN_TIMEOUT_SECONDS", "180"))
+        self._run_lock: asyncio.Lock = asyncio.Lock()
+        self._run_state_lock: asyncio.Lock = asyncio.Lock()
+        self._active_runs: Dict[str, int] = {}
 
     @property
     def last_run(self) -> Optional[datetime]:
@@ -87,6 +91,34 @@ class MonitorService:
 
     def set_last_error(self, message: Optional[str]) -> None:
         self._last_error = message
+
+    @asynccontextmanager
+    async def run_guard(self, source: str, exclusive: bool = True):
+        lock = self._run_lock if exclusive else None
+        if lock:
+            await lock.acquire()
+        try:
+            async with self._run_state_lock:
+                self._active_runs[source] = self._active_runs.get(source, 0) + 1
+            yield
+        finally:
+            async with self._run_state_lock:
+                current = self._active_runs.get(source, 0)
+                if current <= 1:
+                    self._active_runs.pop(source, None)
+                else:
+                    self._active_runs[source] = current - 1
+            if lock:
+                lock.release()
+
+    async def has_active_runs(self, exclude: Optional[Set[str]] = None) -> bool:
+        exclude = exclude or set()
+        async with self._run_state_lock:
+            return any(source not in exclude for source in self._active_runs)
+
+    async def manual_run_active(self) -> bool:
+        async with self._run_state_lock:
+            return self._active_runs.get("manual", 0) > 0
 
     def _create_loader(self):
         if not Instaloader:
@@ -580,8 +612,13 @@ class MonitorService:
             raise ValueError(f"Failed to load session from cookies: {exc}")
 
     def _get_fetch_mode(self, settings) -> str:
-        mode = getattr(settings, "instagram_fetcher", "auto") or "auto"
-        return str(mode).lower()
+        mode = getattr(settings, "instagram_fetcher", "instaloader") or "instaloader"
+        normalized = str(mode).lower()
+        if normalized == "auto":
+            return "instaloader"
+        if normalized not in {"instaloader", "apify"}:
+            return "instaloader"
+        return normalized
 
     def _apify_ready(self, settings) -> bool:
         return bool(getattr(settings, "apify_api_token", None) and getattr(settings, "apify_actor_id", None))
@@ -590,8 +627,6 @@ class MonitorService:
         mode = self._get_fetch_mode(settings)
         if mode == "apify":
             return self._apify_ready(settings)
-        if mode == "auto":
-            return bool(getattr(settings, "apify_enabled", False) and self._apify_ready(settings))
         return False
 
     def _should_use_instaloader(self, settings) -> bool:
@@ -602,19 +637,12 @@ class MonitorService:
 
     def get_apify_runner_status(self, settings) -> str:
         mode = self._get_fetch_mode(settings)
-        apify_enabled = bool(getattr(settings, "apify_enabled", False))
         ready = self._apify_ready(settings)
 
-        if mode == "apify":
-            if not ready:
-                return "unconfigured"
-        elif mode == "auto":
-            if not apify_enabled:
-                return "disabled"
-            if not ready:
-                return "unconfigured"
-        else:
+        if mode != "apify":
             return "disabled"
+        if not ready:
+            return "unconfigured"
 
         client = self._get_apify_client(settings)
         if not client:
@@ -1154,24 +1182,19 @@ class MonitorService:
         posts: List[Dict] = []
         apify_client: Optional[ApifyClient] = None
 
-        if mode == "apify" or (mode == "auto" and (not self._should_use_instaloader(settings))):
+        if mode == "apify":
             apify_client = self._get_apify_client(settings)
             if not apify_client:
-                if mode == "apify":
-                    self.set_last_error("Apify integration is not configured.")
-                    raise ApifyIntegrationError("Apify integration is not configured.")
+                self.set_last_error("Apify integration is not configured.")
+                raise ApifyIntegrationError("Apify integration is not configured.")
             else:
                 try:
                     limit = settings.apify_results_limit or count
                     posts = self._collect_posts_via_apify(apify_client, username, limit, known_post_ids)
                 except (ApifyIntegrationError, ApifyRunTimeoutError) as exc:
-                    if mode == "apify":
-                        self.set_last_error(f"Apify error: {exc}")
-                        raise
                     self.set_last_error(f"Apify error: {exc}")
-                    posts = []
-                if mode == "apify" or posts:
-                    return posts
+                    raise
+                return posts
 
         if not self._should_use_instaloader(settings):
             return posts
@@ -1211,25 +1234,20 @@ class MonitorService:
         posts: List[Dict] = []
         apify_client: Optional[ApifyClient] = None
 
-        if mode == "apify" or (mode == "auto" and (not self._should_use_instaloader(settings))):
+        if mode == "apify":
             apify_client = self._get_apify_client(settings)
             if not apify_client:
-                if mode == "apify":
-                    self.set_last_error("Apify integration is not configured.")
-                    raise ApifyIntegrationError("Apify integration is not configured.")
+                self.set_last_error("Apify integration is not configured.")
+                raise ApifyIntegrationError("Apify integration is not configured.")
             else:
                 try:
                     limit = settings.apify_results_limit or 30
                     posts = self._collect_posts_via_apify(apify_client, username, limit, known_post_ids)
                     posts = [p for p in posts if p.get("timestamp") and p["timestamp"] >= since]
                 except (ApifyIntegrationError, ApifyRunTimeoutError) as exc:
-                    if mode == "apify":
-                        self.set_last_error(f"Apify error: {exc}")
-                        raise
                     self.set_last_error(f"Apify error: {exc}")
-                    posts = []
-                if mode == "apify" or posts:
-                    return posts
+                    raise
+                return posts
 
         if not self._should_use_instaloader(settings):
             return posts

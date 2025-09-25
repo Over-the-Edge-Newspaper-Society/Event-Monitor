@@ -25,6 +25,8 @@ from .models import (
     ExtractedEvent,
     Post,
     ClassificationModeEnum,
+    ScheduledJob,
+    ScheduledJobRun,
     ensure_default_settings,
     DEFAULT_APIFY_ACTOR_ID,
 )
@@ -50,6 +52,11 @@ from .schemas import (
     GeminiApiKeyUpdate,
     ClubEventsExport,
     EventExportItem,
+    ScheduledJobCreate,
+    ScheduledJobUpdate,
+    ScheduledJobOut,
+    ScheduledJobRunOut,
+    ScheduledJobRunDetail,
 )
 from .services.gemini_extractor import (
     GeminiApiKeyMissing,
@@ -59,6 +66,7 @@ from .services.gemini_extractor import (
     extract_event_data_for_post,
 )
 from .services.monitor import monitor_service, RateLimitError, ApifyIntegrationError
+from .services.scheduler import scheduler_service
 from .utils.apify_client import ApifyRunTimeoutError
 from .utils.csv_loader import import_clubs_from_csv
 from .utils.image_downloader import get_image_url
@@ -103,6 +111,7 @@ async def on_startup() -> None:
                 monitor_service.configure_from_settings(settings)
             except Exception:
                 pass
+        await scheduler_service.startup(bool(getattr(settings, "scheduler_enabled", False)))
     finally:
         session.close()
 
@@ -114,6 +123,7 @@ async def on_shutdown() -> None:
         task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await task
+    await scheduler_service.shutdown()
 
 
 @app.get("/health")
@@ -371,6 +381,7 @@ async def update_system_settings(
 ) -> SystemSettingsOut:
     settings = ensure_default_settings(db)
     updated = False
+    scheduler_toggled = False
     if payload.classification_mode is not None:
         settings.classification_mode = payload.classification_mode
         updated = True
@@ -395,17 +406,27 @@ async def update_system_settings(
         updated = True
     if payload.instagram_fetcher is not None:
         fetcher = payload.instagram_fetcher.lower()
-        if fetcher not in {"auto", "instaloader", "apify"}:
+        if fetcher not in {"instaloader", "apify"}:
             raise HTTPException(status_code=400, detail="Invalid Instagram fetcher selection")
         settings.instagram_fetcher = fetcher
+        if payload.apify_enabled is None:
+            settings.apify_enabled = fetcher == "apify"
         updated = True
     if payload.gemini_auto_extract is not None:
         settings.gemini_auto_extract = bool(payload.gemini_auto_extract)
         updated = True
+    if payload.scheduler_enabled is not None:
+        desired = bool(payload.scheduler_enabled)
+        if bool(getattr(settings, "scheduler_enabled", False)) != desired:
+            settings.scheduler_enabled = desired
+            scheduler_toggled = True
+            updated = True
     if updated:
         db.commit()
         db.refresh(settings)
         monitor_service.clear_last_error()
+        if scheduler_toggled:
+            await scheduler_service.set_enabled(bool(settings.scheduler_enabled))
     return _system_settings_out(settings)
 
 
@@ -548,7 +569,8 @@ async def fetch_latest_for_club(
         )
 
     try:
-        stats = monitor_service.fetch_latest_posts_for_club(db, club, post_count, settings)
+        async with monitor_service.run_guard("manual"):
+            stats = monitor_service.fetch_latest_posts_for_club(db, club, post_count, settings)
     except RateLimitError as exc:
         db.rollback()
         detail = str(exc) or "Instagram temporarily blocked our requests. Please try again later."
@@ -667,7 +689,7 @@ async def fetch_latest_posts(post_count: int = 3, db: Session = Depends(get_db))
             }
 
         settings = ensure_default_settings(db)
-        fetch_mode = (settings.instagram_fetcher or "auto").lower()
+        fetch_mode = monitor_service._get_fetch_mode(settings)
         apify_ready = bool(settings.apify_api_token and settings.apify_actor_id)
         has_loader = bool(monitor_service.loader)
 
@@ -681,13 +703,9 @@ async def fetch_latest_posts(post_count: int = 3, db: Session = Depends(get_db))
                 status_code=503,
                 detail="Apify integration is not configured. Add a personal API token before using Apify mode."
             )
-        if fetch_mode == "auto" and not has_loader and not apify_ready:
-            raise HTTPException(
-                status_code=503,
-                detail="No Instagram fetcher is ready. Provide an Instaloader session or Apify credentials."
-            )
 
-        stats = monitor_service.fetch_latest_posts_for_clubs(db, post_count)
+        async with monitor_service.run_guard("manual"):
+            stats = monitor_service.fetch_latest_posts_for_clubs(db, post_count)
         return {
             "success": True,
             "message": f"Successfully fetched posts from {stats['clubs']} clubs",
@@ -735,106 +753,107 @@ async def fetch_latest_posts_stream(post_count: int = 3, db: Session = Depends(g
             if fetch_mode == "apify" and not apify_ready:
                 yield f"data: {json.dumps({'error': 'Apify integration is not configured'})}\n\n"
                 return
-            if fetch_mode == "auto" and not has_loader and not apify_ready:
-                yield f"data: {json.dumps({'error': 'Neither Instaloader nor Apify is ready to fetch'})}\n\n"
-                return
 
-            if monitor_service._in_backoff():
-                if fetch_mode != "instaloader" and apify_ready:
-                    monitor_service.clear_backoff()
-                else:
-                    wait_seconds = monitor_service.next_run_eta_seconds or monitor_service.rate_limit_backoff_minutes * 60
-                    yield f"data: {json.dumps({'status': 'error', 'error': f'Instagram is throttling requests. Please retry in {max(wait_seconds // 60, 1)} minutes.'})}\n\n"
-                    return
-
-            yield f"data: {json.dumps({'status': 'starting', 'message': f'Starting to fetch {post_count} posts from {active_clubs_count} clubs'})}\n\n"
-
-            stats = {"clubs": 0, "posts": 0, "classified": 0}
-            monitor_service._last_run = datetime.utcnow()
-
-            global_auto = (settings.classification_mode or ClassificationModeEnum.MANUAL).lower() == ClassificationModeEnum.AUTO
-
-            clubs = db.query(Club).filter(Club.active.is_(True)).all()
-            total_clubs = len(clubs)
-
-            apify_bulk_cache: Dict[str, List[Dict]] = {}
-            apify_known_map: Dict[str, Set[str]] = {}
-            if fetch_mode == "apify":
-                apify_client = monitor_service._get_apify_client(settings)
-                if not apify_client:
-                    yield f"data: {json.dumps({'status': 'error', 'error': 'Apify integration is not configured.'})}\n\n"
-                    return
-                apify_known_map = {
-                    club.username: monitor_service._get_recent_post_ids(db, club.id)
-                    for club in clubs
-                }
-                configured_limit = settings.apify_results_limit or post_count
-                limit = max(1, min(configured_limit, post_count))
-                try:
-                    apify_bulk_cache = monitor_service._collect_posts_via_apify_bulk(
-                        apify_client,
-                        [club.username for club in clubs],
-                        limit,
-                        apify_known_map,
-                    )
-                except ApifyIntegrationError as exc:
-                    yield f"data: {json.dumps({'status': 'error', 'error': str(exc) or 'Apify integration failed to return results.'})}\n\n"
-                    return
-
-            for i, club in enumerate(clubs, 1):
-                yield f"data: {json.dumps({'status': 'processing', 'current_club': club.username, 'progress': i, 'total': total_clubs, 'message': f'Processing {club.name} ({i}/{total_clubs})'})}\n\n"
-
-                stats["clubs"] += 1
-                try:
-                    if fetch_mode == "apify":
-                        known_ids = apify_known_map.get(club.username, set())
-                        posts = apify_bulk_cache.get(club.username, [])
+            async with monitor_service.run_guard("manual"):
+                if monitor_service._in_backoff():
+                    if fetch_mode == "apify" and apify_ready:
+                        monitor_service.clear_backoff()
                     else:
-                        known_ids = monitor_service._get_recent_post_ids(db, club.id)
-                        posts = monitor_service._fetch_latest_posts_for_club(
-                            settings,
-                            club.username,
-                            post_count,
-                            known_ids,
+                        wait_seconds = (
+                            monitor_service.next_run_eta_seconds
+                            or monitor_service.rate_limit_backoff_minutes * 60
                         )
-                except RateLimitError as exc:
-                    db.rollback()
-                    monitor_service.set_last_error(str(exc))
-                    monitor_service._schedule_backoff()
-                    yield f"data: {json.dumps({'status': 'error', 'error': str(exc) or 'Instagram temporarily blocked our requests. Please try again later.'})}\n\n"
-                    return
-                except ApifyIntegrationError as exc:
-                    db.rollback()
-                    monitor_service.set_last_error(str(exc))
-                    yield f"data: {json.dumps({'status': 'error', 'error': str(exc) or 'Apify integration failed to return results.'})}\n\n"
-                    return
-                except ApifyRunTimeoutError as exc:
-                    db.rollback()
-                    monitor_service.set_last_error(str(exc))
-                    yield f"data: {json.dumps({'status': 'error', 'error': str(exc) or 'Apify run timed out before completion.'})}\n\n"
-                    return
-                except ApifyIntegrationError as exc:
-                    db.rollback()
-                    monitor_service.set_last_error(str(exc))
-                    yield f"data: {json.dumps({'status': 'error', 'error': str(exc) or 'Apify integration failed to return results.'})}\n\n"
-                    return
+                        yield f"data: {json.dumps({'status': 'error', 'error': f'Instagram is throttling requests. Please retry in {max(wait_seconds // 60, 1)} minutes.'})}\n\n"
+                        return
 
-                for post in posts:
-                    auto_classify = global_auto and (club.classification_mode or ClassificationModeEnum.MANUAL).lower() == ClassificationModeEnum.AUTO
-                    if monitor_service._create_post_if_new(db, club, post, auto_classify, settings):
-                        stats["posts"] += 1
-                        if auto_classify:
-                            stats["classified"] += 1
+                yield f"data: {json.dumps({'status': 'starting', 'message': f'Starting to fetch {post_count} posts from {active_clubs_count} clubs'})}\n\n"
 
-                club.last_checked = datetime.utcnow()
-                yield f"data: {json.dumps({'status': 'completed_club', 'club': club.username, 'posts_found': len(posts), 'progress': i, 'total': total_clubs})}\n\n"
-                monitor_service._apply_delay(settings.club_fetch_delay_seconds)
+                stats = {"clubs": 0, "posts": 0, "classified": 0}
+                monitor_service._last_run = datetime.utcnow()
 
-            db.commit()
-            clubs_count = stats["clubs"]
-            completion_message = f'Successfully fetched posts from {clubs_count} clubs'
-            monitor_service.clear_last_error()
-            yield f"data: {json.dumps({'status': 'completed', 'message': completion_message, 'stats': stats})}\n\n"
+                global_auto = (settings.classification_mode or ClassificationModeEnum.MANUAL).lower() == ClassificationModeEnum.AUTO
+
+                clubs = db.query(Club).filter(Club.active.is_(True)).all()
+                total_clubs = len(clubs)
+
+                apify_bulk_cache: Dict[str, List[Dict]] = {}
+                apify_known_map: Dict[str, Set[str]] = {}
+                if fetch_mode == "apify":
+                    apify_client = monitor_service._get_apify_client(settings)
+                    if not apify_client:
+                        yield f"data: {json.dumps({'status': 'error', 'error': 'Apify integration is not configured.'})}\n\n"
+                        return
+                    apify_known_map = {
+                        club.username: monitor_service._get_recent_post_ids(db, club.id)
+                        for club in clubs
+                    }
+                    configured_limit = settings.apify_results_limit or post_count
+                    limit = max(1, min(configured_limit, post_count))
+                    try:
+                        apify_bulk_cache = monitor_service._collect_posts_via_apify_bulk(
+                            apify_client,
+                            [club.username for club in clubs],
+                            limit,
+                            apify_known_map,
+                        )
+                    except ApifyIntegrationError as exc:
+                        yield f"data: {json.dumps({'status': 'error', 'error': str(exc) or 'Apify integration failed to return results.'})}\n\n"
+                        return
+
+                for i, club in enumerate(clubs, 1):
+                    yield f"data: {json.dumps({'status': 'processing', 'current_club': club.username, 'progress': i, 'total': total_clubs, 'message': f'Processing {club.name} ({i}/{total_clubs})'})}\n\n"
+
+                    stats["clubs"] += 1
+                    try:
+                        if fetch_mode == "apify":
+                            known_ids = apify_known_map.get(club.username, set())
+                            posts = apify_bulk_cache.get(club.username, [])
+                        else:
+                            known_ids = monitor_service._get_recent_post_ids(db, club.id)
+                            posts = monitor_service._fetch_latest_posts_for_club(
+                                settings,
+                                club.username,
+                                post_count,
+                                known_ids,
+                            )
+                    except RateLimitError as exc:
+                        db.rollback()
+                        monitor_service.set_last_error(str(exc))
+                        monitor_service._schedule_backoff()
+                        yield f"data: {json.dumps({'status': 'error', 'error': str(exc) or 'Instagram temporarily blocked our requests. Please try again later.'})}\n\n"
+                        return
+                    except ApifyIntegrationError as exc:
+                        db.rollback()
+                        monitor_service.set_last_error(str(exc))
+                        yield f"data: {json.dumps({'status': 'error', 'error': str(exc) or 'Apify integration failed to return results.'})}\n\n"
+                        return
+                    except ApifyRunTimeoutError as exc:
+                        db.rollback()
+                        monitor_service.set_last_error(str(exc))
+                        yield f"data: {json.dumps({'status': 'error', 'error': str(exc) or 'Apify run timed out before completion.'})}\n\n"
+                        return
+                    except ApifyIntegrationError as exc:
+                        db.rollback()
+                        monitor_service.set_last_error(str(exc))
+                        yield f"data: {json.dumps({'status': 'error', 'error': str(exc) or 'Apify integration failed to return results.'})}\n\n"
+                        return
+
+                    for post in posts:
+                        auto_classify = global_auto and (club.classification_mode or ClassificationModeEnum.MANUAL).lower() == ClassificationModeEnum.AUTO
+                        if monitor_service._create_post_if_new(db, club, post, auto_classify, settings):
+                            stats["posts"] += 1
+                            if auto_classify:
+                                stats["classified"] += 1
+
+                    club.last_checked = datetime.utcnow()
+                    yield f"data: {json.dumps({'status': 'completed_club', 'club': club.username, 'posts_found': len(posts), 'progress': i, 'total': total_clubs})}\n\n"
+                    monitor_service._apply_delay(settings.club_fetch_delay_seconds)
+
+                db.commit()
+                clubs_count = stats["clubs"]
+                completion_message = f'Successfully fetched posts from {clubs_count} clubs'
+                monitor_service.clear_last_error()
+                yield f"data: {json.dumps({'status': 'completed', 'message': completion_message, 'stats': stats})}\n\n"
 
         except Exception as e:
             import traceback
@@ -843,6 +862,9 @@ async def fetch_latest_posts_stream(post_count: int = 3, db: Session = Depends(g
             yield f"data: {json.dumps({'status': 'error', 'error': error_detail})}\n\n"
 
     return StreamingResponse(generate_progress(), media_type="text/plain")
+
+
+
 
 
 @app.get("/clubs", response_model=List[ClubOut])
@@ -1091,6 +1113,7 @@ def _render_status(settings) -> MonitorStatus:
         session_age_minutes = max(int(delta.total_seconds() // 60), 0)
     is_rate_limited = bool(rate_limit_until and rate_limit_until > now)
     apify_runner = monitor_service.get_apify_runner_status(settings)
+    fetch_mode = monitor_service._get_fetch_mode(settings)
     return MonitorStatus(
         monitoring_enabled=settings.monitoring_enabled,
         monitor_interval_minutes=settings.monitor_interval_minutes,
@@ -1098,7 +1121,7 @@ def _render_status(settings) -> MonitorStatus:
         next_run_eta_seconds=monitor_service.next_run_eta_seconds,
         classification_mode=settings.classification_mode,
         apify_enabled=settings.apify_enabled,
-        instagram_fetcher=settings.instagram_fetcher,
+        instagram_fetcher=fetch_mode,
         apify_runner=apify_runner,
         last_error=monitor_service.last_error,
         session_username=settings.instaloader_username,
@@ -1127,10 +1150,221 @@ def _system_settings_out(settings) -> SystemSettingsOut:
         has_apify_token=bool(getattr(settings, "apify_api_token", None)),
         has_gemini_api_key=bool((settings.gemini_api_key or "").strip() or os.getenv("GEMINI_API_KEY")),
         gemini_auto_extract=bool(getattr(settings, "gemini_auto_extract", False)),
-        instagram_fetcher=(settings.instagram_fetcher or "auto"),
+        instagram_fetcher=monitor_service._get_fetch_mode(settings),
+        scheduler_enabled=bool(getattr(settings, "scheduler_enabled", False)),
         created_at=_iso(settings.created_at),
         updated_at=_iso(settings.updated_at),
     )
+
+
+def _scheduled_job_to_out(job: ScheduledJob) -> ScheduledJobOut:
+    aps_job = scheduler_service.scheduler.get_job(f"scheduler-job-{job.id}") if scheduler_service.scheduler else None
+    next_run = getattr(aps_job, "next_run_time", None)
+
+    return ScheduledJobOut(
+        id=job.id,
+        name=job.name,
+        job_type=job.job_type,
+        enabled=bool(job.enabled),
+        schedule_type=job.schedule_type,
+        cron_expression=job.cron_expression,
+        interval_minutes=job.interval_minutes,
+        timezone=job.timezone,
+        skip_if_running=bool(job.skip_if_running),
+        skip_if_manual_running=bool(job.skip_if_manual_running),
+        payload=job.payload,
+        last_run_at=job.last_run_at,
+        next_run_at=next_run,
+        created_at=job.created_at,
+        updated_at=job.updated_at,
+    )
+
+
+def _scheduled_run_to_out(run: ScheduledJobRun) -> ScheduledJobRunOut:
+    return ScheduledJobRunOut.from_orm(run)
+
+
+def _get_scheduled_job_or_404(db: Session, job_id: int) -> ScheduledJob:
+    job = db.query(ScheduledJob).filter(ScheduledJob.id == job_id).one_or_none()
+    if not job:
+        raise HTTPException(status_code=404, detail="Scheduled job not found")
+    return job
+
+
+@app.get("/scheduler/jobs", response_model=List[ScheduledJobOut])
+async def list_scheduler_jobs(db: Session = Depends(get_db)) -> List[ScheduledJobOut]:
+    jobs = (
+        db.query(ScheduledJob)
+        .order_by(ScheduledJob.created_at.asc())
+        .all()
+    )
+    return [_scheduled_job_to_out(job) for job in jobs]
+
+
+@app.post("/scheduler/jobs", response_model=ScheduledJobOut, status_code=201)
+async def create_scheduler_job(
+    payload: ScheduledJobCreate,
+    db: Session = Depends(get_db),
+) -> ScheduledJobOut:
+    try:
+        scheduler_service.validate_schedule(
+            payload.schedule_type,
+            payload.cron_expression,
+            payload.interval_minutes,
+            payload.timezone,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    job = ScheduledJob(
+        name=payload.name,
+        job_type=payload.job_type,
+        enabled=payload.enabled,
+        schedule_type=payload.schedule_type,
+        cron_expression=payload.cron_expression,
+        interval_minutes=payload.interval_minutes,
+        timezone=payload.timezone,
+        skip_if_running=payload.skip_if_running,
+        skip_if_manual_running=payload.skip_if_manual_running,
+        payload=payload.payload or {},
+    )
+    db.add(job)
+    db.commit()
+    db.refresh(job)
+    await scheduler_service.refresh_job(job.id)
+    return _scheduled_job_to_out(job)
+
+
+@app.get("/scheduler/jobs/{job_id}", response_model=ScheduledJobOut)
+async def get_scheduler_job(job_id: int, db: Session = Depends(get_db)) -> ScheduledJobOut:
+    job = _get_scheduled_job_or_404(db, job_id)
+    return _scheduled_job_to_out(job)
+
+
+@app.patch("/scheduler/jobs/{job_id}", response_model=ScheduledJobOut)
+async def update_scheduler_job(
+    job_id: int,
+    payload: ScheduledJobUpdate,
+    db: Session = Depends(get_db),
+) -> ScheduledJobOut:
+    job = _get_scheduled_job_or_404(db, job_id)
+    data = payload.dict(exclude_unset=True)
+
+    schedule_type = data.get("schedule_type", job.schedule_type)
+    timezone = data.get("timezone", job.timezone)
+    if schedule_type == "cron":
+        cron_expression = data.get("cron_expression", job.cron_expression)
+        interval_minutes = None
+        if not cron_expression:
+            raise HTTPException(status_code=400, detail="cron_expression is required for cron schedules")
+    else:
+        interval_minutes = data.get("interval_minutes", job.interval_minutes)
+        cron_expression = None
+        if not interval_minutes:
+            raise HTTPException(status_code=400, detail="interval_minutes is required for interval schedules")
+
+    try:
+        scheduler_service.validate_schedule(schedule_type, cron_expression, interval_minutes, timezone)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    if "name" in data:
+        job.name = data["name"]
+    if "job_type" in data:
+        job.job_type = data["job_type"]
+    if "enabled" in data:
+        job.enabled = data["enabled"]
+    job.schedule_type = schedule_type
+    job.cron_expression = cron_expression
+    job.interval_minutes = interval_minutes
+    job.timezone = timezone
+    if "skip_if_running" in data:
+        job.skip_if_running = data["skip_if_running"]
+    if "skip_if_manual_running" in data:
+        job.skip_if_manual_running = data["skip_if_manual_running"]
+    if "payload" in data:
+        job.payload = data["payload"] or {}
+
+    db.add(job)
+    db.commit()
+    db.refresh(job)
+    await scheduler_service.refresh_job(job.id)
+    return _scheduled_job_to_out(job)
+
+
+@app.delete("/scheduler/jobs/{job_id}", status_code=204)
+async def delete_scheduler_job(job_id: int, db: Session = Depends(get_db)):
+    job = _get_scheduled_job_or_404(db, job_id)
+    await scheduler_service.remove_job(job.id)
+    db.delete(job)
+    db.commit()
+
+
+@app.post("/scheduler/jobs/{job_id}/run", response_model=ScheduledJobRunDetail)
+async def trigger_scheduler_job(job_id: int, db: Session = Depends(get_db)) -> ScheduledJobRunDetail:
+    job = _get_scheduled_job_or_404(db, job_id)
+    run_id = await scheduler_service.run_job_now(job.id)
+    if not run_id:
+        raise HTTPException(status_code=500, detail="Failed to start job run")
+    run = db.query(ScheduledJobRun).filter(ScheduledJobRun.id == run_id).one_or_none()
+    if not run:
+        raise HTTPException(status_code=404, detail="Job run not found")
+    return ScheduledJobRunDetail.from_orm(run)
+
+
+@app.get("/scheduler/jobs/{job_id}/runs", response_model=List[ScheduledJobRunOut])
+async def list_scheduler_job_runs(
+    job_id: int,
+    limit: int = 25,
+    db: Session = Depends(get_db),
+) -> List[ScheduledJobRunOut]:
+    _ = _get_scheduled_job_or_404(db, job_id)
+    bounded_limit = max(1, min(limit, 200))
+    runs = (
+        db.query(ScheduledJobRun)
+        .filter(ScheduledJobRun.job_id == job_id)
+        .order_by(ScheduledJobRun.started_at.desc())
+        .limit(bounded_limit)
+        .all()
+    )
+    return [_scheduled_run_to_out(run) for run in runs]
+
+
+@app.get("/scheduler/jobs/{job_id}/runs/{run_id}", response_model=ScheduledJobRunDetail)
+async def get_scheduler_job_run(
+    job_id: int,
+    run_id: int,
+    db: Session = Depends(get_db),
+) -> ScheduledJobRunDetail:
+    _ = _get_scheduled_job_or_404(db, job_id)
+    run = (
+        db.query(ScheduledJobRun)
+        .filter(ScheduledJobRun.job_id == job_id, ScheduledJobRun.id == run_id)
+        .one_or_none()
+    )
+    if not run:
+        raise HTTPException(status_code=404, detail="Job run not found")
+    return ScheduledJobRunDetail.from_orm(run)
+
+
+@app.get("/scheduler/jobs/{job_id}/runs/{run_id}/log")
+async def get_scheduler_job_run_log(
+    job_id: int,
+    run_id: int,
+    db: Session = Depends(get_db),
+):
+    _ = _get_scheduled_job_or_404(db, job_id)
+    run = (
+        db.query(ScheduledJobRun)
+        .filter(ScheduledJobRun.job_id == job_id, ScheduledJobRun.id == run_id)
+        .one_or_none()
+    )
+    if not run or not run.log_path:
+        raise HTTPException(status_code=404, detail="Log not found for this run")
+    log_path = Path(run.log_path)
+    if not log_path.exists() or not log_path.is_file():
+        raise HTTPException(status_code=404, detail="Log file is not available")
+    return FileResponse(log_path, media_type="text/plain")
 
 
 def _run_gemini_auto_extract(post_id: int) -> None:

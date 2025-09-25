@@ -100,9 +100,10 @@ class SystemSetting(Base):
     apify_actor_id = Column(String(255), default=DEFAULT_APIFY_ACTOR_ID, nullable=True)
     apify_results_limit = Column(Integer, default=30, nullable=False)
     apify_api_token = Column(String(512), nullable=True)
-    instagram_fetcher = Column(String(20), default="auto", nullable=False)
+    instagram_fetcher = Column(String(20), default="instaloader", nullable=False)
     gemini_api_key = Column(String(512), nullable=True)
     gemini_auto_extract = Column(Boolean, default=False, nullable=False)
+    scheduler_enabled = Column(Boolean, default=False, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
 
@@ -122,11 +123,13 @@ def ensure_default_settings(session) -> SystemSetting:
     if "apify_api_token" not in columns:
         alter_statements.append("ADD COLUMN apify_api_token VARCHAR(512)")
     if "instagram_fetcher" not in columns:
-        alter_statements.append("ADD COLUMN instagram_fetcher VARCHAR(20) DEFAULT 'auto' NOT NULL")
+        alter_statements.append("ADD COLUMN instagram_fetcher VARCHAR(20) DEFAULT 'instaloader' NOT NULL")
     if "gemini_api_key" not in columns:
         alter_statements.append("ADD COLUMN gemini_api_key VARCHAR(512)")
     if "gemini_auto_extract" not in columns:
         alter_statements.append("ADD COLUMN gemini_auto_extract BOOLEAN DEFAULT 0 NOT NULL")
+    if "scheduler_enabled" not in columns:
+        alter_statements.append("ADD COLUMN scheduler_enabled BOOLEAN DEFAULT 0 NOT NULL")
 
     if alter_statements:
         with bind.connect() as conn:
@@ -143,6 +146,7 @@ def ensure_default_settings(session) -> SystemSetting:
             classification_mode=ClassificationModeEnum.AUTO,
             club_fetch_delay_seconds=2,
             apify_actor_id=DEFAULT_APIFY_ACTOR_ID,
+            scheduler_enabled=False,
         )
         session.add(setting)
         session.commit()
@@ -166,14 +170,18 @@ def ensure_default_settings(session) -> SystemSetting:
         if setting.apify_enabled is None:
             setting.apify_enabled = False
             updated = True
-        if not getattr(setting, "instagram_fetcher", None):
-            setting.instagram_fetcher = "auto"
+        current_fetcher = getattr(setting, "instagram_fetcher", None)
+        if not current_fetcher or current_fetcher == "auto":
+            setting.instagram_fetcher = "instaloader"
             updated = True
         if not hasattr(setting, "gemini_api_key"):
             setting.gemini_api_key = None
             updated = True
         if getattr(setting, "gemini_auto_extract", None) is None:
             setting.gemini_auto_extract = False
+            updated = True
+        if getattr(setting, "scheduler_enabled", None) is None:
+            setting.scheduler_enabled = False
             updated = True
 
     env_actor_id = os.getenv("APIFY_ACTOR_ID")
@@ -182,9 +190,12 @@ def ensure_default_settings(session) -> SystemSetting:
         updated = True
 
     env_token = os.getenv("APIFY_API_TOKEN")
-    if env_token and setting.apify_api_token != env_token:
-        setting.apify_api_token = env_token
-        updated = True
+    if env_token:
+        current = (setting.apify_api_token or "").strip()
+        if not current or current == "your-apify-token-here":
+            if current != env_token:
+                setting.apify_api_token = env_token
+                updated = True
 
     env_enabled = os.getenv("APIFY_ENABLED")
     if env_enabled is not None:
@@ -207,10 +218,63 @@ def ensure_default_settings(session) -> SystemSetting:
     env_fetcher = os.getenv("APIFY_FETCHER_MODE")
     if env_fetcher:
         normalized_fetcher = env_fetcher.strip().lower()
-        if normalized_fetcher in {"auto", "instaloader", "apify"} and setting.instagram_fetcher != normalized_fetcher:
-            setting.instagram_fetcher = normalized_fetcher
+        if normalized_fetcher == "auto":
+            normalized_fetcher = "instaloader"
+        if normalized_fetcher in {"instaloader", "apify"} and setting.instagram_fetcher != normalized_fetcher:
+            if getattr(setting, "instagram_fetcher", None) in {None, "auto", "instaloader"}:
+                setting.instagram_fetcher = normalized_fetcher
+                updated = True
+
+    env_scheduler = os.getenv("SCHEDULER_ENABLED")
+    if env_scheduler is not None:
+        normalized_scheduler = env_scheduler.strip().lower()
+        desired_scheduler = normalized_scheduler in {"1", "true", "yes", "on"}
+        if bool(getattr(setting, "scheduler_enabled", False)) != desired_scheduler:
+            setting.scheduler_enabled = desired_scheduler
             updated = True
     if updated:
         session.commit()
         session.refresh(setting)
     return setting
+
+
+class ScheduledJob(Base):
+    __tablename__ = "scheduled_jobs"
+
+    id = Column(Integer, primary_key=True)
+    name = Column(String(255), nullable=False)
+    job_type = Column(String(50), nullable=False)
+    schedule_type = Column(String(20), default="interval", nullable=False)
+    cron_expression = Column(String(100), nullable=True)
+    interval_minutes = Column(Integer, nullable=True)
+    timezone = Column(String(64), nullable=True)
+    enabled = Column(Boolean, default=True, nullable=False)
+    skip_if_running = Column(Boolean, default=True, nullable=False)
+    skip_if_manual_running = Column(Boolean, default=True, nullable=False)
+    payload = Column(JSON, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+    last_run_at = Column(DateTime, nullable=True)
+
+    runs = relationship(
+        "ScheduledJobRun",
+        back_populates="job",
+        cascade="all, delete-orphan",
+        order_by="desc(ScheduledJobRun.started_at)",
+    )
+
+
+class ScheduledJobRun(Base):
+    __tablename__ = "scheduled_job_runs"
+
+    id = Column(Integer, primary_key=True)
+    job_id = Column(Integer, ForeignKey("scheduled_jobs.id", ondelete="CASCADE"), nullable=False, index=True)
+    status = Column(String(20), nullable=False, default="running")
+    started_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    finished_at = Column(DateTime, nullable=True)
+    detail = Column(Text, nullable=True)
+    log_path = Column(String(512), nullable=True)
+    log_excerpt = Column(Text, nullable=True)
+    payload_snapshot = Column(JSON, nullable=True)
+
+    job = relationship("ScheduledJob", back_populates="runs")
